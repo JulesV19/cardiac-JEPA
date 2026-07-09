@@ -93,6 +93,9 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=None)
     ap.add_argument("--resume", default=None,
                     help="chemin d'un checkpoint, ou 'auto' pour <out>/latest.pt")
+    ap.add_argument("--stop-epoch", type=int, default=None,
+                    help="dernière epoch à exécuter (indice, inclus). Le planning de LR "
+                         "reste calculé sur cfg.epochs -> comparaison d'ablation valide.")
     args = ap.parse_args()
 
     cfg = yaml.safe_load(open(args.config))
@@ -240,6 +243,11 @@ def main() -> None:
         save_ckpt(out_dir / "latest.pt", epoch)
         if (epoch + 1) % tcfg["ckpt_every"] == 0 or epoch + 1 == tcfg["epochs"]:
             save_ckpt(out_dir / f"ckpt_e{epoch}.pt", epoch)
+
+        if args.stop_epoch is not None and epoch >= args.stop_epoch:
+            save_ckpt(out_dir / f"ckpt_e{epoch}.pt", epoch)
+            print(f"arrêt demandé après l'epoch {epoch} (--stop-epoch)")
+            break
 
     csv_f.close()
     print(f"Terminé. Métriques : {csv_path}")
