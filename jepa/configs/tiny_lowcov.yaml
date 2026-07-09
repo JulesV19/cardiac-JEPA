@@ -1,0 +1,34 @@
+# Config ViT-tiny — pré-entraînement JEPA PTB-XL 100 Hz.
+model:
+  grid_h: 12
+  grid_w: 40
+  patch_len: 25
+  embed_dim: 192
+  depth: 12
+  heads: 3
+  mlp_ratio: 4.0
+  pred_dim: 96
+  pred_depth: 6
+  pred_heads: 3
+
+mask:
+  num_target_blocks: 4
+  target_scale: [0.15, 0.20]
+  target_aspect: [0.5, 2.0]
+  min_context_tokens: 48   # contexte = complément des cibles ; garde-fou anti-tirage dégénéré
+
+train:
+  batch_size: 256
+  epochs: 100
+  base_lr: 1.5e-4        # référence pour batch=256, scalé linéairement
+  weight_decay: 0.05
+  warmup_frac: 0.1
+  lambda_var: 1.0
+  lambda_cov: 0.005   # ablation : relache la pression de blanchiment (ref: 0.04)
+  ema_start: 0.996
+  ema_end: 1.0
+  num_workers: 4
+  amp: true
+  log_every: 20          # steps
+  val_batches: 8         # nb de batches val pour le monitoring collapse
+  ckpt_every: 10         # epochs

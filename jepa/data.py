@@ -29,6 +29,7 @@ CACHE_PATH = Path(os.environ.get("PTBXL_CACHE", _ROOT / "cache" / "ptbxl_100hz.n
 N_SAMPLES = 1000      # 10 s à 100 Hz
 N_LEADS = 12
 LEADS = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
+SUPERCLASSES = ["NORM", "MI", "STTC", "CD", "HYP"]   # tâche multi-label en aval
 
 
 def load_metadata(data_dir: Path | None = None) -> pd.DataFrame:
@@ -60,11 +61,14 @@ def zscore_per_lead(sig: np.ndarray, eps: float = 1e-6) -> np.ndarray:
 class PTBXLDataset(Dataset):
     """ECG normalisés pour un sous-ensemble de folds.
 
-    Renvoie un tenseur float32 (N_SAMPLES, N_LEADS). Le masquage n'est PAS fait ici.
+    Renvoie un tenseur float32 (N_SAMPLES, N_LEADS), ou `(signal, label)` si
+    `with_labels=True` (label = vecteur multi-hot float32 sur SUPERCLASSES).
+    Le masquage n'est PAS fait ici.
     """
 
     def __init__(self, split: str = "pretrain", data_dir: Path | None = None,
-                 cache_path: Path | None = None):
+                 cache_path: Path | None = None, with_labels: bool = False,
+                 drop_unlabeled: bool = False):
         self.data_dir = Path(data_dir) if data_dir else DATA_DIR
         cache_path = Path(cache_path) if cache_path else CACHE_PATH
 
@@ -76,14 +80,23 @@ class PTBXLDataset(Dataset):
         elif split == "test":
             mask = df.strat_fold == 10
         elif split == "all":
-            mask = np.ones(len(df), dtype=bool)
+            mask = pd.Series(True, index=df.index)
         else:
             raise ValueError(f"split inconnu: {split}")
+
+        if drop_unlabeled:
+            mask = mask & (df.superclass.str.len() > 0)
 
         # Position 0-based dans l'ordre du CSV = index dans le cache .npy.
         self.positions = np.where(mask.to_numpy())[0]
         self.df = df
         self._filenames = df.filename_lr.to_numpy()
+
+        self.with_labels = with_labels
+        if with_labels:
+            self.labels = np.zeros((len(df), len(SUPERCLASSES)), dtype=np.float32)
+            for j, c in enumerate(SUPERCLASSES):
+                self.labels[:, j] = df.superclass.apply(lambda s: c in s).to_numpy()
 
         # Cache mémoire (memmap = lazy, pas de copie RAM immédiate).
         self._cache = None
@@ -106,8 +119,11 @@ class PTBXLDataset(Dataset):
         sig, _ = self._wfdb.rdsamp(str(self.data_dir / self._filenames[pos]))
         return sig.astype(np.float32)
 
-    def __getitem__(self, i: int) -> torch.Tensor:
+    def __getitem__(self, i: int):
         pos = int(self.positions[i])
         sig = self._read_raw(pos)
         sig = zscore_per_lead(sig)
-        return torch.from_numpy(np.ascontiguousarray(sig, dtype=np.float32))
+        x = torch.from_numpy(np.ascontiguousarray(sig, dtype=np.float32))
+        if self.with_labels:
+            return x, torch.from_numpy(self.labels[pos])
+        return x
