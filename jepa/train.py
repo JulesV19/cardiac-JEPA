@@ -125,10 +125,14 @@ def main() -> None:
 
     collate = MaskCollator(mask_cfg)
     dl_kw = dict(batch_size=tcfg["batch_size"], collate_fn=collate,
-                 num_workers=tcfg["num_workers"], drop_last=True,
+                 num_workers=tcfg["num_workers"],
                  persistent_workers=tcfg["num_workers"] > 0)
-    train_dl = DataLoader(train_ds, shuffle=True, **dl_kw)
-    val_dl = DataLoader(val_ds, shuffle=False, **dl_kw)
+    train_dl = DataLoader(train_ds, shuffle=True, drop_last=True, **dl_kw)
+    # drop_last=False sur val : sinon un val plus petit qu'un batch => 0 batch
+    # => monitoring anti-collapse silencieusement absent.
+    val_dl = DataLoader(val_ds, shuffle=False, drop_last=False, **dl_kw)
+    if len(val_dl) == 0:
+        raise RuntimeError("split val vide : le monitoring anti-collapse serait inactif.")
 
     model = JEPA(model_cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -163,14 +167,24 @@ def main() -> None:
                     "scaler": scaler.state_dict(), "epoch": epoch, "step": step,
                     "cfg": cfg}, path)
 
+    HEADER = ["phase", "epoch", "step", "lr", "momentum", "total", "jepa",
+              "var", "cov", "emb_std_ctx", "emb_std_tgt", "pred_std",
+              "eff_rank_ctx", "eff_rank_tgt", "r2", "cos"]
     csv_path = out_dir / "metrics.csv"
-    new_csv = not (csv_path.exists() and start_epoch > 0)
-    csv_f = open(csv_path, "w" if new_csv else "a", newline="")
+    append = csv_path.exists() and start_epoch > 0
+    if append:
+        # Si le schéma a changé (nouvelles colonnes), on archive plutôt que de mélanger.
+        with open(csv_path) as f:
+            old = f.readline().strip().split(",")
+        if old != HEADER:
+            backup = csv_path.with_suffix(".prev.csv")
+            csv_path.rename(backup)
+            print(f"schéma CSV modifié -> ancien fichier archivé dans {backup.name}")
+            append = False
+    csv_f = open(csv_path, "a" if append else "w", newline="")
     writer = csv.writer(csv_f)
-    if new_csv:
-        writer.writerow(["phase", "epoch", "step", "lr", "momentum", "total", "jepa",
-                         "var", "cov", "emb_std_ctx", "emb_std_tgt", "pred_std",
-                         "eff_rank_ctx", "eff_rank_tgt"])
+    if not append:
+        writer.writerow(HEADER)
 
     for epoch in range(start_epoch, tcfg["epochs"]):
         model.train()
@@ -200,7 +214,7 @@ def main() -> None:
                 writer.writerow(["train", epoch, step, f"{lr:.2e}", f"{m:.5f}",
                                  f"{parts['total']:.4f}", f"{parts['jepa']:.4f}",
                                  f"{parts['var']:.4f}", f"{parts['cov']:.4f}",
-                                 "", "", "", "", ""])
+                                 "", "", "", "", "", "", ""])
                 csv_f.flush()
                 print(f"e{epoch} s{step} lr{lr:.1e} m{m:.4f} "
                       f"L{parts['total']:.3f} jepa{parts['jepa']:.3f} "
@@ -213,12 +227,14 @@ def main() -> None:
             writer.writerow(["val", epoch, step, "", "", "", "", "", "",
                              f"{rep['emb_std_ctx']:.4f}", f"{rep['emb_std_tgt']:.4f}",
                              f"{rep['pred_std']:.4f}", f"{rep['eff_rank_ctx']:.2f}",
-                             f"{rep['eff_rank_tgt']:.2f}"])
+                             f"{rep['eff_rank_tgt']:.2f}", f"{rep['r2']:.4f}",
+                             f"{rep['cos']:.4f}"])
             csv_f.flush()
             flag = "  ⚠ COLLAPSE" if is_collapsing(rep) else ""
-            print(f"[val e{epoch}] emb_std_ctx={rep['emb_std_ctx']:.4f} "
-                  f"eff_rank_ctx={rep['eff_rank_ctx']:.2f} "
-                  f"({time.time()-t0:.1f}s){flag}", flush=True)
+            print(f"[val e{epoch}] R2={rep['r2']:.3f} cos={rep['cos']:.3f} | "
+                  f"std ctx={rep['emb_std_ctx']:.3f} tgt={rep['emb_std_tgt']:.3f} "
+                  f"pred={rep['pred_std']:.3f} | rang ctx={rep['eff_rank_ctx']:.1f} "
+                  f"tgt={rep['eff_rank_tgt']:.1f} ({time.time()-t0:.0f}s){flag}", flush=True)
 
         # latest.pt à chaque epoch : une déconnexion Colab ne coûte qu'une epoch.
         save_ckpt(out_dir / "latest.pt", epoch)

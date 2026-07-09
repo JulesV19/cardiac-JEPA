@@ -9,6 +9,7 @@ Le collapse se lit sur les embeddings de l'encodeur :
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 
 @torch.no_grad()
@@ -39,15 +40,36 @@ def effective_rank(z: torch.Tensor, eps: float = 1e-12) -> float:
 
 
 @torch.no_grad()
+def prediction_quality(pred: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
+    """Qualité de prédiction, INDÉPENDANTE de la difficulté des cibles.
+
+    La loss JEPA brute n'est comparable à rien : la cible bouge (encodeur EMA) et s'étale
+    sous l'effet de VICReg, donc l'erreur croît mécaniquement à qualité constante.
+
+    r2  : 1 - MSE(pred, tgt) / Var(tgt). Compare au prédicteur trivial « toujours la
+          moyenne des cibles ». 0 = pas mieux que l'idiot, 1 = parfait, <0 = pire que l'idiot.
+    cos : similarité cosinus moyenne — pointe-t-on dans la bonne direction ?
+    """
+    p = pred.reshape(-1, pred.shape[-1]).float()
+    t = target.reshape(-1, target.shape[-1]).float()
+    mse = (p - t).pow(2).mean()
+    var = (t - t.mean(dim=0, keepdim=True)).pow(2).mean()
+    r2 = 1.0 - mse / (var + 1e-12)
+    cos = F.cosine_similarity(p, t, dim=-1).mean()
+    return {"r2": r2.item(), "cos": cos.item()}
+
+
+@torch.no_grad()
 def collapse_report(z_context: torch.Tensor, z_target: torch.Tensor,
                     pred: torch.Tensor) -> dict[str, float]:
-    """Métriques scalaires de suivi du collapse sur un batch."""
+    """Métriques scalaires de suivi du collapse et de la qualité de prédiction."""
     return {
         "emb_std_ctx": embedding_std(z_context),
         "emb_std_tgt": embedding_std(z_target),
         "pred_std": embedding_std(pred),
         "eff_rank_ctx": effective_rank(z_context),
         "eff_rank_tgt": effective_rank(z_target),
+        **prediction_quality(pred, z_target),
     }
 
 
