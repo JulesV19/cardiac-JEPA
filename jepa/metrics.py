@@ -13,8 +13,11 @@ import torch
 
 @torch.no_grad()
 def embedding_std(z: torch.Tensor) -> float:
-    """std moyen par dimension des embeddings. z : (..., D) aplati sur (N, D)."""
-    z = z.reshape(-1, z.shape[-1])
+    """std moyen par dimension des embeddings. z : (..., D) aplati sur (N, D).
+
+    float32 obligatoire : la variance sur N≈60 000 lignes déborde en fp16.
+    """
+    z = z.reshape(-1, z.shape[-1]).float()
     return z.std(dim=0).mean().item()
 
 

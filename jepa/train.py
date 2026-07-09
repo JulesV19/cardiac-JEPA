@@ -188,8 +188,9 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, enabled=use_amp):
                 pred, z_tgt, z_ctx = model(sig, cidx, tidx)
-                loss, parts = total_loss(pred, z_tgt, z_ctx,
-                                         tcfg["lambda_var"], tcfg["lambda_cov"])
+            # Loss hors autocast : VICReg déborde en fp16 (cf. jepa/losses.py).
+            loss, parts = total_loss(pred, z_tgt, z_ctx,
+                                     tcfg["lambda_var"], tcfg["lambda_cov"])
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
