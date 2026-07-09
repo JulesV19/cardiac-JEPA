@@ -1,0 +1,19 @@
+# Dataset PTB-XL (3,2 Go) — retéléchargé depuis PhysioNet, jamais versionné.
+ptb-xl-a-large-publicly-available-electrocardiography-dataset-*/
+
+# Cache signaux (~1 Go) et sorties d'entraînement.
+cache/
+runs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Notebooks : on versionne le code, pas les sorties lourdes (figures, checkpoints inline).
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store

@@ -1,0 +1,7 @@
+# Colab fournit déjà torch, numpy, pandas, matplotlib.
+# wfdb n'est nécessaire que pour construire le cache (build_cache.py).
+wfdb>=4.1
+pyyaml>=6.0
+# Exploration locale uniquement :
+# plotly>=5.0
+# ipywidgets>=8.0
