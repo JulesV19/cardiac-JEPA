@@ -96,7 +96,12 @@ def main() -> None:
     ap.add_argument("--stop-epoch", type=int, default=None,
                     help="dernière epoch à exécuter (indice, inclus). Le planning de LR "
                          "reste calculé sur cfg.epochs -> comparaison d'ablation valide.")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="graine : init des poids, masques, ordre des batches")
     args = ap.parse_args()
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     cfg = yaml.safe_load(open(args.config))
     tcfg = cfg["train"]
@@ -126,7 +131,7 @@ def main() -> None:
         train_ds = Subset(train_ds, range(min(args.limit, len(train_ds))))
         val_ds = Subset(val_ds, range(min(args.limit // 4 or 1, len(val_ds))))
 
-    collate = MaskCollator(mask_cfg)
+    collate = MaskCollator(mask_cfg, seed=args.seed)
     dl_kw = dict(batch_size=tcfg["batch_size"], collate_fn=collate,
                  num_workers=tcfg["num_workers"],
                  persistent_workers=tcfg["num_workers"] > 0)

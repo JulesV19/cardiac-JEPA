@@ -53,6 +53,16 @@ class ECGClassifier(nn.Module):
         return self.head(z.mean(dim=1))    # (B, n_classes)
 
 
+def labels_of(ds) -> np.ndarray:
+    """Matrice multi-hot (N, 5) d'un PTBXLDataset ou d'un Subset imbriqué.
+
+    Lit `labels` directement : ne charge aucun signal.
+    """
+    if isinstance(ds, Subset):
+        return labels_of(ds.dataset)[np.asarray(ds.indices)]
+    return ds.labels[ds.positions]
+
+
 def build_param_groups(model: ECGClassifier, head_lr: float, encoder_lr: float,
                        weight_decay: float):
     """4 groupes : {encodeur, tête} x {avec, sans weight decay}.
@@ -109,9 +119,19 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=None)
     ap.add_argument("--limit", type=int, default=None, help="sous-ensemble (smoke test)")
     ap.add_argument("--device", default=None)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="graine : init de la tête, ordre des batches, ET choix du "
+                         "sous-échantillon de labels (identique entre les bras)")
+    ap.add_argument("--train-frac", type=float, default=1.0,
+                    help="fraction des labels d'entraînement (régime peu-de-labels)")
     args = ap.parse_args()
     if not args.ckpt and not args.random_init:
         ap.error("donne --ckpt, ou --random-init pour le contrôle")
+    if not 0 < args.train_frac <= 1:
+        ap.error("--train-frac doit être dans ]0, 1]")
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     cfg = yaml.safe_load(open(args.config))["train"]
     for k, v in [("epochs", args.epochs), ("batch_size", args.batch_size),
@@ -149,11 +169,29 @@ def main() -> None:
              for s in ("pretrain", "val", "test")}
     if args.limit:
         dsets = {s: Subset(d, range(min(args.limit, len(d)))) for s, d in dsets.items()}
+
+    # Régime peu-de-labels : sous-échantillon tiré avec un RNG dédié à la graine, donc
+    # STRICTEMENT identique entre le bras JEPA et le bras aléatoire (sinon la comparaison
+    # ne veut rien dire). Val et test restent complets.
+    train_ds = dsets["pretrain"]
+    if args.train_frac < 1.0:
+        n = max(1, int(round(args.train_frac * len(train_ds))))
+        sel = np.sort(np.random.default_rng(args.seed).choice(len(train_ds), n, replace=False))
+        train_ds = Subset(train_ds, sel.tolist())
+    y_tr = labels_of(train_ds)
+    prev = y_tr.sum(axis=0).astype(int)
+    print(f"train={len(train_ds)} ({100*args.train_frac:.1f}% des labels, seed={args.seed})"
+          f"  val={len(dsets['val'])} test={len(dsets['test'])}")
+    print("  positifs par classe : " + "  ".join(f"{c}={n}" for c, n in zip(SUPERCLASSES, prev)))
+    if (prev < 2).any():
+        print("  ATTENTION : une classe a <2 positifs, son AUROC sera indéfinie.")
+
     dl_kw = dict(batch_size=cfg["batch_size"], num_workers=cfg["num_workers"])
-    train_dl = DataLoader(dsets["pretrain"], shuffle=True, drop_last=True, **dl_kw)
+    drop = len(train_ds) >= 4 * cfg["batch_size"]
+    train_dl = DataLoader(train_ds, shuffle=True, drop_last=drop, **dl_kw)
     val_dl = DataLoader(dsets["val"], shuffle=False, **dl_kw)
     test_dl = DataLoader(dsets["test"], shuffle=False, **dl_kw)
-    print(f"train={len(dsets['pretrain'])} val={len(dsets['val'])} test={len(dsets['test'])}")
+    assert len(train_dl) > 0, "batch_size trop grand pour ce sous-échantillon"
 
     opt = torch.optim.AdamW(
         build_param_groups(model, cfg["head_lr"], cfg["encoder_lr"], cfg["weight_decay"]),
