@@ -31,4 +31,4 @@ train:
   amp: true
   log_every: 20          # steps
   val_batches: 8         # nb de batches val pour le monitoring collapse
-  ckpt_every: 10         # epochs
+  ckpt_every: 20         # latest.pt chaque epoch + periodiques espaces (94 Mo piece)
