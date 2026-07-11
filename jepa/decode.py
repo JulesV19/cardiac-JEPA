@@ -42,6 +42,12 @@ from .masking import MaskCollator, MaskConfig
 from .models import ModelConfig
 from .train import pick_device
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:                       # fallback : pas de barre, aucun crash
+    def tqdm(x, **kw):
+        return x
+
 
 def to_patches(x: torch.Tensor, H: int, W: int, P: int) -> torch.Tensor:
     """Signal (B, W*P, H) -> patches par token (B, H*W, P), même ordre que PatchEmbed.
@@ -72,44 +78,71 @@ class PatchDecoder(nn.Module):
 # ---------------------------------------------------------------------------
 # Étape 1 : entraîner le lecteur neutre D sur les vrais embeddings z_tgt (tous les tokens).
 # ---------------------------------------------------------------------------
-def _reader_epoch(dec, encoder, loader, cfg, device, opt=None):
-    """Une passe. opt=None -> évaluation (renvoie MSE moyenne). Sinon entraîne D."""
-    train = opt is not None
-    dec.train(train)
-    H, W, P = cfg.grid_h, cfg.grid_w, cfg.patch_len
-    sse, n = 0.0, 0
-    for x in loader:
+@torch.no_grad()
+def precompute_tokens(encoder, split, device, batch_size, workers, use_amp):
+    """Forward de l'encodeur GELÉ, UNE seule fois -> (embeddings LN, patches cibles).
+
+    Les deux sont aplatis par token en (N*H*W, .) et stockés en **fp16 sur CPU** : l'encodeur
+    ne changeant jamais, on ne recalcule pas ce forward coûteux à chaque epoch du lecteur.
+    """
+    H, W, P = encoder.cfg.grid_h, encoder.cfg.grid_w, encoder.cfg.patch_len
+    D = encoder.cfg.embed_dim
+    ds = PTBXLDataset(split)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=workers)
+    N = len(ds) * H * W
+    Z = torch.empty(N, D, dtype=torch.float16)          # préalloué -> pas de pic x2 au concat
+    T = torch.empty(N, P, dtype=torch.float16)
+    encoder.eval()
+    i = 0
+    for x in tqdm(dl, desc=f"précalcul {split}", unit="batch"):
         x = x.to(device)
-        with torch.no_grad():
-            z = ln(encoder(x, None))                 # (B, H*W, D) embeddings EMA LayerNormés
-        target = to_patches(x, H, W, P)              # (B, H*W, P)
-        with torch.set_grad_enabled(train):
-            out = dec(z)
-            loss = F.mse_loss(out, target)
-        if train:
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
-        bs = x.shape[0] * H * W * P
-        sse += loss.item() * bs
-        n += bs
-    return sse / n
+        with torch.autocast(device_type=device.type, enabled=use_amp):
+            z = ln(encoder(x, None))                     # (B, H*W, D)
+        n = z.shape[0] * H * W
+        Z[i:i + n] = z.reshape(-1, D).half().cpu()
+        T[i:i + n] = to_patches(x, H, W, P).reshape(-1, P).half().cpu()
+        i += n
+    return Z, T
 
 
-def train_reader(dec, encoder, device, epochs, lr, weight_decay, batch_size, workers):
-    """Entraîne D sur folds 1-8, sélectionne le meilleur epoch sur fold 9 (MSE). Renvoie MSE val."""
-    tr = DataLoader(PTBXLDataset("pretrain"), batch_size=batch_size, shuffle=True,
-                    num_workers=workers, drop_last=True)
-    va = DataLoader(PTBXLDataset("val"), batch_size=batch_size, shuffle=False,
-                    num_workers=workers)
+def train_reader(dec, encoder, device, epochs, lr, weight_decay, batch_size, workers, use_amp):
+    """Entraîne D sur folds 1-8 (cache), sélectionne le meilleur epoch sur fold 9 (MSE)."""
+    Ztr, Ttr = precompute_tokens(encoder, "pretrain", device, batch_size, workers, use_amp)
+    Zva, Tva = precompute_tokens(encoder, "val", device, batch_size, workers, use_amp)
+    gb = (Ztr.nelement() + Ttr.nelement()) * Ztr.element_size() / 1e9
+    print(f"  cache tokens : train {tuple(Ztr.shape)}  val {tuple(Zva.shape)}  (~{gb:.1f} Go fp16)")
+
     opt = torch.optim.AdamW(dec.parameters(), lr=lr, weight_decay=weight_decay)
+    row_bs = 8192                        # batch de TOKENS (le MLP est par-token, indépendant)
+    n = Ztr.shape[0]
+
+    def val_mse() -> float:
+        dec.eval()
+        sse, cnt = 0.0, 0
+        with torch.no_grad():
+            for j in range(0, Zva.shape[0], row_bs):
+                z = Zva[j:j + row_bs].to(device).float()
+                t = Tva[j:j + row_bs].to(device).float()
+                sse += F.mse_loss(dec(z), t, reduction="sum").item()
+                cnt += t.numel()
+        return sse / cnt
+
     best = (float("inf"), None)
-    for ep in range(epochs):
-        tr_mse = _reader_epoch(dec, encoder, tr, encoder.cfg, device, opt)
-        va_mse = _reader_epoch(dec, encoder, va, encoder.cfg, device, None)
-        print(f"  epoch {ep:02d}  train_mse={tr_mse:.4f}  val_mse={va_mse:.4f}")
-        if va_mse < best[0]:
-            best = (va_mse, {k: v.detach().clone() for k, v in dec.state_dict().items()})
+    pbar = tqdm(range(epochs), desc="entraînement lecteur", unit="epoch")
+    for ep in pbar:
+        dec.train()
+        perm = torch.randperm(n)
+        for j in range(0, n, row_bs):
+            idx = perm[j:j + row_bs]
+            z = Ztr[idx].to(device).float()
+            t = Ttr[idx].to(device).float()
+            opt.zero_grad(set_to_none=True)
+            F.mse_loss(dec(z), t).backward()
+            opt.step()
+        va = val_mse()
+        pbar.set_postfix(val_mse=f"{va:.4f}")   # % d'epochs + MSE val courante
+        if va < best[0]:
+            best = (va, {k: v.detach().clone() for k, v in dec.state_dict().items()})
     dec.load_state_dict(best[1])
     return best[0]
 
@@ -118,7 +151,7 @@ def train_reader(dec, encoder, device, epochs, lr, weight_decay, batch_size, wor
 # Étape 3 : évaluer sur les zones MASQUÉES — D(z_tgt) vs D(pred).
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def eval_masked(dec, model, device, batch_size, workers, mask_cfg, seed,
+def eval_masked(dec, model, device, batch_size, workers, mask_cfg, seed, use_amp=False,
                 plots: int = 0, out_dir: Path | None = None):
     """MSE de reconstruction sur les patches masqués : borne haute (z_tgt) vs prédiction (pred)."""
     cfg = model.cfg
@@ -134,10 +167,12 @@ def eval_masked(dec, model, device, batch_size, workers, mask_cfg, seed,
         cidx = batch["context_idx"].to(device)
         tidx = batch["target_idx"].to(device)
 
-        z_ctx = model.encoder(x, cidx)                      # (B, n_ctx, D)
-        pred = model.predictor(z_ctx, cidx, tidx)           # (B, n_tgt, D) — prédiction JEPA
-        z_full = ln(model.target_encoder(x, None))          # (B, H*W, D)
-        z_tgt = z_full.index_select(1, tidx)                # (B, n_tgt, D) — vrais embeddings
+        with torch.autocast(device_type=device.type, enabled=use_amp):
+            z_ctx = model.encoder(x, cidx)                  # (B, n_ctx, D)
+            pred = model.predictor(z_ctx, cidx, tidx)       # (B, n_tgt, D) — prédiction JEPA
+            z_full = ln(model.target_encoder(x, None))      # (B, H*W, D)
+        pred = pred.float()                                 # retour fp32 pour décodeur/MSE/plot
+        z_tgt = z_full.float().index_select(1, tidx)        # (B, n_tgt, D) — vrais embeddings
 
         patches = to_patches(x, H, W, P).index_select(1, tidx)   # (B, n_tgt, P) — cible
         rec_pred = dec(pred)
@@ -211,6 +246,7 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device) if args.device else pick_device()
+    use_amp = device.type == "cuda"    # forward encodeur en fp16 sur GPU (pas de VICReg ici)
 
     if args.random_init:
         model = JEPA(ModelConfig())
@@ -230,12 +266,13 @@ def main() -> None:
 
     print("Étape 1 — entraînement du lecteur neutre D sur les vrais embeddings :")
     val_mse = train_reader(dec, model.target_encoder, device, args.epochs, args.lr,
-                           args.weight_decay, args.batch_size, args.workers)
+                           args.weight_decay, args.batch_size, args.workers, use_amp)
 
     out_dir = Path(args.out).parent if args.out else Path(".")
+    out_dir.mkdir(parents=True, exist_ok=True)   # PNG + result.json y sont écrits
     print("\nÉtape 3 — évaluation sur les zones masquées (fold 10) :")
     res = eval_masked(dec, model, device, args.batch_size, args.workers,
-                      MaskConfig(), args.seed, plots=args.plots, out_dir=out_dir)
+                      MaskConfig(), args.seed, use_amp, plots=args.plots, out_dir=out_dir)
 
     print(f"\nreader val_mse = {val_mse:.4f}")
     print(f"  D(z_tgt) borne haute  : MSE={res['tgt']['mse']:.4f}  R²={res['tgt']['r2']:.4f}")
