@@ -1,0 +1,42 @@
+# Config CNN-JEPA — encodeur 1D (dérivations = canaux), grille 1 x 40 tokens temporels.
+# Le ViT (tiny.yaml) reste la config de référence ; celle-ci est un modèle ADDITIONNEL.
+model:
+  encoder_type: cnn
+  grid_h: 1                # 1 seule "ligne" : les 12 dérivations sont des CANAUX, pas des tokens
+  grid_w: 40               # 40 tokens temporels (1000 / 25)
+  patch_len: 25            # échantillons par token temporel (0.25 s @ 100 Hz)
+  embed_dim: 192           # largeur des tokens de sortie (comparable au ViT-tiny)
+  # --- encodeur CNN ---
+  cnn_channels: [64, 128]  # canaux par étage
+  cnn_blocks_per_stage: 2
+  cnn_strides: [5, 5]      # produit = 25 -> downsample temporel 1000 -> 40
+  cnn_kernel: 7
+  # --- predictor (transformer, inchangé, bottleneck) ---
+  pred_dim: 96
+  pred_depth: 6
+  pred_heads: 3
+
+mask:
+  # Grille 1x40 : pour obtenir des blocs temporels LARGES malgré la décomposition en racine
+  # d'aire, l'aspect (h/w) doit être petit (h forcé à 1). Fraction masquée cible ~35-45 %.
+  # (grid_h / grid_w sont injectés par train.py, ne pas les mettre ici.)
+  num_target_blocks: 3
+  target_scale: [0.10, 0.18]
+  target_aspect: [0.10, 0.25]
+  min_context_tokens: 8       # 48 est impossible sur 40 tokens
+
+train:
+  batch_size: 256
+  epochs: 100
+  base_lr: 1.5e-4        # référence pour batch=256, scalé linéairement
+  weight_decay: 0.05
+  warmup_frac: 0.1
+  lambda_var: 1.0
+  lambda_cov: 0.04
+  ema_start: 0.996
+  ema_end: 1.0
+  num_workers: 4
+  amp: true
+  log_every: 20          # steps
+  val_batches: 8         # nb de batches val pour le monitoring collapse
+  ckpt_every: 20         # latest.pt chaque epoch + periodiques espacés

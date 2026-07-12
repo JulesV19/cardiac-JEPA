@@ -3,13 +3,19 @@
 Conventions de tokens (cohérentes avec masking.py) :
 - grille H=12 leads × W=40 patches temporels, token idx = lead*W + time (row-major).
 - patch = 25 échantillons d'une seule dérivation → projection linéaire (pas de conv).
+
+Variante `encoder_type="cnn"` (ConvEncoder) : encodeur 1D, dérivations = canaux d'entrée,
+grille H=1 × W=40 (40 tokens temporels), token idx = time. Le predictor est inchangé.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import gcd
 
 import torch
 import torch.nn as nn
+
+from .data import N_LEADS
 
 
 @dataclass
@@ -24,6 +30,13 @@ class ModelConfig:
     pred_dim: int = 96        # predictor plus étroit (bottleneck)
     pred_depth: int = 6
     pred_heads: int = 3
+
+    encoder_type: str = "vit"           # "vit" (défaut) ou "cnn"
+    # --- hyperparams encodeur CNN (ignorés si encoder_type == "vit") ---
+    cnn_channels: tuple = (64, 128)     # canaux de sortie par étage
+    cnn_blocks_per_stage: int = 2       # blocs résiduels par étage
+    cnn_strides: tuple = (5, 5)         # produit = downsample temporel (5*5=25 -> 1000/25=40)
+    cnn_kernel: int = 7
 
     @property
     def num_tokens(self) -> int:
@@ -111,6 +124,76 @@ class Encoder(nn.Module):
         return self.norm(tokens)
 
 
+def _gn(ch: int) -> nn.GroupNorm:
+    """GroupNorm avec un nb de groupes qui divise `ch` (≤ 8). Pas de BatchNorm : stats de
+    batch + cible EMA + input-masking = source de bugs silencieux."""
+    return nn.GroupNorm(num_groups=max(gcd(ch, 8), 1), num_channels=ch)
+
+
+class _ResBlock1D(nn.Module):
+    """Bloc résiduel 1D pre-activation-libre : (conv-GN-GELU) ×2 + skip (down si besoin)."""
+
+    def __init__(self, in_ch: int, out_ch: int, kernel: int, stride: int):
+        super().__init__()
+        pad = kernel // 2
+        self.conv1 = nn.Conv1d(in_ch, out_ch, kernel, stride=stride, padding=pad, bias=False)
+        self.gn1 = _gn(out_ch)
+        self.conv2 = nn.Conv1d(out_ch, out_ch, kernel, stride=1, padding=pad, bias=False)
+        self.gn2 = _gn(out_ch)
+        self.act = nn.GELU()
+        if stride != 1 or in_ch != out_ch:
+            self.down = nn.Sequential(
+                nn.Conv1d(in_ch, out_ch, 1, stride=stride, bias=False), _gn(out_ch))
+        else:
+            self.down = nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.act(self.gn1(self.conv1(x)))
+        h = self.gn2(self.conv2(h))
+        return self.act(self.down(x) + h)
+
+
+class ConvEncoder(nn.Module):
+    """Encodeur CNN 1D (dérivations = canaux) : (B, W*P, H) -> (B, W, embed_dim).
+
+    Même interface que `Encoder` : `forward(signals, token_idx=None)`. Les 12 dérivations
+    physiques sont les CANAUX d'entrée du CNN (à ne pas confondre avec `grid_h=1`, qui n'est
+    que le nb de lignes de la grille de tokens). La grille est H=1 × W (40 tokens temporels),
+    token idx = time. Le downsample temporel vient du produit des `cnn_strides` ;
+    `AdaptiveAvgPool1d(W)` garantit exactement W tokens en sortie.
+    """
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        self.cfg = cfg
+        k = cfg.cnn_kernel
+        self.stem = nn.Sequential(
+            nn.Conv1d(N_LEADS, cfg.cnn_channels[0], k, stride=1, padding=k // 2, bias=False),
+            _gn(cfg.cnn_channels[0]), nn.GELU())
+        stages, in_ch = [], cfg.cnn_channels[0]
+        for out_ch, stride in zip(cfg.cnn_channels, cfg.cnn_strides):
+            for b in range(cfg.cnn_blocks_per_stage):
+                stages.append(_ResBlock1D(in_ch, out_ch, k, stride if b == 0 else 1))
+                in_ch = out_ch
+        self.stages = nn.Sequential(*stages)
+        self.head = nn.Conv1d(in_ch, cfg.embed_dim, 1)      # projection finale -> embed_dim
+        self.pool = nn.AdaptiveAvgPool1d(cfg.grid_w)        # force exactement W tokens
+        self.norm = nn.LayerNorm(cfg.embed_dim)
+        self.apply(_init_weights)
+
+    def forward(self, signals: torch.Tensor, token_idx: torch.Tensor | None = None):
+        B, n_samples, n_leads = signals.shape
+        W, P = self.cfg.grid_w, self.cfg.patch_len
+        assert n_leads == N_LEADS and n_samples == W * P, \
+            f"attendu ({W*P},{N_LEADS}), reçu ({n_samples},{n_leads})"
+        x = signals.transpose(1, 2)                          # (B, N_LEADS=canaux, T)
+        x = self.pool(self.head(self.stages(self.stem(x))))  # (B, embed_dim, W)
+        tokens = x.transpose(1, 2)                           # (B, W, embed_dim)
+        if token_idx is not None:
+            tokens = _gather(tokens, token_idx)
+        return self.norm(tokens)
+
+
 class Predictor(nn.Module):
     """Prédit les embeddings des tokens cibles depuis les tokens de contexte.
 
@@ -153,7 +236,11 @@ def _init_weights(m: nn.Module) -> None:
         nn.init.trunc_normal_(m.weight, std=0.02)
         if m.bias is not None:
             nn.init.zeros_(m.bias)
-    elif isinstance(m, nn.LayerNorm):
+    elif isinstance(m, nn.Conv1d):
+        nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+    elif isinstance(m, (nn.LayerNorm, nn.GroupNorm)):
         nn.init.ones_(m.weight)
         nn.init.zeros_(m.bias)
 

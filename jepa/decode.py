@@ -264,8 +264,15 @@ def main() -> None:
     use_amp = device.type == "cuda"    # forward encodeur en fp16 sur GPU (pas de VICReg ici)
 
     if args.random_init:
-        model = JEPA(ModelConfig())
-        tag = "random-init (contrôle)"
+        # iso-architecture : si un --ckpt est fourni, on reprend SA config (mêmes dims que le
+        # JEPA testé) sans charger les poids. Sinon, défaut ViT-tiny.
+        if args.ckpt:
+            cfg_m = torch.load(args.ckpt, map_location="cpu", weights_only=False)["cfg"]["model"]
+            model = JEPA(ModelConfig(**cfg_m))
+            tag = f"random-init iso-archi de {args.ckpt}"
+        else:
+            model = JEPA(ModelConfig())
+            tag = "random-init (contrôle, ViT-tiny)"
     else:
         ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
         model = JEPA(ModelConfig(**ck["cfg"]["model"]))

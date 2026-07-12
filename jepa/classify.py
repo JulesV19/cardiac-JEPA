@@ -145,8 +145,15 @@ def main() -> None:
 
     # --- Encodeur : pré-entraîné ou aléatoire (même architecture) ---
     if args.random_init:
-        jepa = JEPA(ModelConfig())
-        tag = "random-init (contrôle)"
+        # iso-architecture : si un --ckpt est fourni, on reprend SA config (mêmes dims que le
+        # JEPA testé) sans charger les poids. Sinon, défaut ViT-tiny.
+        if args.ckpt:
+            cfg_m = torch.load(args.ckpt, map_location="cpu", weights_only=False)["cfg"]["model"]
+            jepa = JEPA(ModelConfig(**cfg_m))
+            tag = f"random-init iso-archi de {args.ckpt}"
+        else:
+            jepa = JEPA(ModelConfig())
+            tag = "random-init (contrôle, ViT-tiny)"
     else:
         ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
         jepa = JEPA(ModelConfig(**ck["cfg"]["model"]))
