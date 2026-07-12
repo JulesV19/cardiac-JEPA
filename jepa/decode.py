@@ -160,7 +160,11 @@ def eval_masked(dec, model, device, batch_size, workers, mask_cfg, seed, use_amp
     dl = DataLoader(PTBXLDataset("test"), batch_size=batch_size, shuffle=False,
                     num_workers=workers, collate_fn=collator)
     dec.eval()
-    agg = {"pred": [0.0, 0], "tgt": [0.0, 0]}   # [sse, n]
+    # pred_ln = D(ln(pred)) : contrôle du bémol méthodo. D a été entraîné sur z_tgt LayerNormé,
+    # or pred sort du predictor non-normalisé. On LN pred comme les cibles pour décontaminer la
+    # chute d'un éventuel décalage de distribution. Écart pred_ln↔pred = part imputable à l'échelle ;
+    # écart pred_ln↔tgt = vraie erreur de prédiction, à distribution appariée.
+    agg = {"pred": [0.0, 0], "pred_ln": [0.0, 0], "tgt": [0.0, 0]}   # [sse, n]
     plotted = 0
     for batch in dl:
         x = batch["signals"].to(device)
@@ -172,13 +176,15 @@ def eval_masked(dec, model, device, batch_size, workers, mask_cfg, seed, use_amp
             pred = model.predictor(z_ctx, cidx, tidx)       # (B, n_tgt, D) — prédiction JEPA
             z_full = ln(model.target_encoder(x, None))      # (B, H*W, D)
         pred = pred.float()                                 # retour fp32 pour décodeur/MSE/plot
+        pred_ln = ln(pred)                                  # même normalisation par-token que z_tgt
         z_tgt = z_full.float().index_select(1, tidx)        # (B, n_tgt, D) — vrais embeddings
 
         patches = to_patches(x, H, W, P).index_select(1, tidx)   # (B, n_tgt, P) — cible
         rec_pred = dec(pred)
+        rec_pred_ln = dec(pred_ln)
         rec_tgt = dec(z_tgt)
 
-        for key, rec in (("pred", rec_pred), ("tgt", rec_tgt)):
+        for key, rec in (("pred", rec_pred), ("pred_ln", rec_pred_ln), ("tgt", rec_tgt)):
             agg[key][0] += F.mse_loss(rec, patches, reduction="sum").item()
             agg[key][1] += patches.numel()
 
@@ -188,7 +194,7 @@ def eval_masked(dec, model, device, batch_size, workers, mask_cfg, seed, use_amp
             plotted += 1
 
     res = {}
-    for key in ("tgt", "pred"):
+    for key in ("tgt", "pred", "pred_ln"):
         mse = agg[key][0] / agg[key][1]
         res[key] = {"mse": mse, "r2": 1.0 - mse}   # Var≈1 (signal z-normé) -> R² = 1 - MSE
     return res
@@ -275,8 +281,9 @@ def main() -> None:
                       MaskConfig(), args.seed, use_amp, plots=args.plots, out_dir=out_dir)
 
     print(f"\nreader val_mse = {val_mse:.4f}")
-    print(f"  D(z_tgt) borne haute  : MSE={res['tgt']['mse']:.4f}  R²={res['tgt']['r2']:.4f}")
-    print(f"  D(pred)  prédiction   : MSE={res['pred']['mse']:.4f}  R²={res['pred']['r2']:.4f}")
+    print(f"  D(z_tgt)   borne haute      : MSE={res['tgt']['mse']:.4f}  R²={res['tgt']['r2']:.4f}")
+    print(f"  D(pred)    prédiction       : MSE={res['pred']['mse']:.4f}  R²={res['pred']['r2']:.4f}")
+    print(f"  D(ln pred) préd. LN-appariée : MSE={res['pred_ln']['mse']:.4f}  R²={res['pred_ln']['r2']:.4f}")
 
     if args.out:
         Path(args.out).write_text(json.dumps(
