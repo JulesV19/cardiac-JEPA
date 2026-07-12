@@ -206,26 +206,33 @@ def _plot_example(x, cidx, tidx, rec_pred, rec_tgt, cfg, path: Path):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    from matplotlib.lines import Line2D
+
     H, W, P = cfg.grid_h, cfg.grid_w, cfg.patch_len
     true = x.detach().cpu().numpy()                          # (W*P, H)
     tset = set(tidx.cpu().tolist())
     tpos = {int(t): i for i, t in enumerate(tidx.cpu().tolist())}
-    rp = rec_pred.detach().cpu().numpy()                     # (n_tgt, P)
+    rp = rec_pred.detach().cpu().numpy()                     # (n_tgt, P) — D(pred), prédiction
+    rt = rec_tgt.detach().cpu().numpy()                      # (n_tgt, P) — D(z_tgt), borne haute
 
     leads = [0, 1, 6, 7]                                     # I, II, V1, V2
     fig, axes = plt.subplots(len(leads), 1, figsize=(11, 2.0 * len(leads)), sharex=True)
     t = np.arange(W * P)
     for ax, lead in zip(axes, leads):
-        ax.plot(t, true[:, lead], color="black", lw=0.8, label="vrai")
+        ax.plot(t, true[:, lead], color="black", lw=0.8)
         for w in range(W):
             tok = lead * W + w
             if tok in tset:
                 sl = slice(w * P, (w + 1) * P)
-                ax.plot(t[sl], rp[tpos[tok]], color="crimson", lw=1.1)
+                ax.plot(t[sl], rt[tpos[tok]], color="royalblue", lw=1.1)   # borne haute D(z_tgt)
+                ax.plot(t[sl], rp[tpos[tok]], color="crimson", lw=1.1)     # prédiction D(pred)
                 ax.axvspan(w * P, (w + 1) * P, color="crimson", alpha=0.07)
         ax.set_ylabel(f"lead {lead}")
-    axes[0].legend(loc="upper right", fontsize=8)
-    axes[0].set_title("noir = vrai · rouge = prédiction JEPA décodée (zones masquées)")
+    handles = [Line2D([0], [0], color="black", lw=0.8, label="vrai"),
+               Line2D([0], [0], color="royalblue", lw=1.1, label="D(z_tgt) borne haute"),
+               Line2D([0], [0], color="crimson", lw=1.1, label="D(pred) prédiction")]
+    axes[0].legend(handles=handles, loc="upper right", fontsize=8)
+    axes[0].set_title("noir = vrai · bleu = borne haute D(z_tgt) · rouge = prédiction JEPA (zones masquées)")
     fig.tight_layout()
     fig.savefig(path, dpi=110)
     plt.close(fig)
