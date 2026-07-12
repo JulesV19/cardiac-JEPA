@@ -253,6 +253,8 @@ def main() -> None:
     ap.add_argument("--plots", type=int, default=0, help="nb d'exemples PNG à sauver")
     ap.add_argument("--device", default=None)
     ap.add_argument("--out", default=None, help="fichier .json de résultats")
+    ap.add_argument("--retrain-decoder", action="store_true",
+                    help="ignore le décodeur sauvé et le ré-entraîne")
     args = ap.parse_args()
     if not args.ckpt and not args.random_init:
         ap.error("donne --ckpt, ou --random-init pour le contrôle")
@@ -277,12 +279,31 @@ def main() -> None:
     cfg = model.cfg
     dec = PatchDecoder(cfg.embed_dim, cfg.patch_len, hidden=args.hidden).to(device)
 
-    print("Étape 1 — entraînement du lecteur neutre D sur les vrais embeddings :")
-    val_mse = train_reader(dec, model.target_encoder, device, args.epochs, args.lr,
-                           args.weight_decay, args.batch_size, args.workers, use_amp)
-
     out_dir = Path(args.out).parent if args.out else Path(".")
-    out_dir.mkdir(parents=True, exist_ok=True)   # PNG + result.json y sont écrits
+    out_dir.mkdir(parents=True, exist_ok=True)   # décodeur + PNG + result.json y sont écrits
+    dec_path = out_dir / "decoder.pt"
+    # D dépend du checkpoint (encodeur EMA) et des hyper-params du lecteur -> signature de garde.
+    sig = {"embed_dim": cfg.embed_dim, "patch_len": cfg.patch_len,
+           "hidden": args.hidden, "tag": tag, "seed": args.seed}
+
+    val_mse = None
+    if dec_path.exists() and not args.retrain_decoder:
+        blob = torch.load(dec_path, map_location=device, weights_only=False)
+        if blob.get("sig") == sig:
+            dec.load_state_dict(blob["state_dict"])
+            val_mse = blob["val_mse"]
+            print(f"Étape 1 — lecteur D rechargé depuis {dec_path} "
+                  f"(val_mse={val_mse:.4f}, pas de ré-entraînement)")
+        else:
+            print(f"Étape 1 — {dec_path} présent mais signature différente -> ré-entraînement")
+
+    if val_mse is None:
+        print("Étape 1 — entraînement du lecteur neutre D sur les vrais embeddings :")
+        val_mse = train_reader(dec, model.target_encoder, device, args.epochs, args.lr,
+                               args.weight_decay, args.batch_size, args.workers, use_amp)
+        torch.save({"state_dict": dec.state_dict(), "val_mse": val_mse, "sig": sig}, dec_path)
+        print(f"  meilleur lecteur D sauvegardé -> {dec_path}")
+
     print("\nÉtape 3 — évaluation sur les zones masquées (fold 10) :")
     res = eval_masked(dec, model, device, args.batch_size, args.workers,
                       MaskConfig(), args.seed, use_amp, plots=args.plots, out_dir=out_dir)
