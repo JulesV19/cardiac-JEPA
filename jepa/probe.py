@@ -29,7 +29,6 @@ from torch.utils.data import DataLoader, Subset
 from .data import SUPERCLASSES, PTBXLDataset
 from .jepa import JEPA
 from .models import ModelConfig
-from .train import pick_device
 
 
 @torch.no_grad()
@@ -90,6 +89,29 @@ def train_linear_head(Xtr, ytr, Xva, yva, device, epochs=100, lr=1e-3,
     return head, best[0]
 
 
+@torch.no_grad()
+def _standardize_fit(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    return X.mean(0, keepdims=True), X.std(0, keepdims=True) + 1e-6
+
+
+def quick_probe_auroc(encoder: nn.Module, device, train_limit: int = 4000,
+                      workers: int = 2) -> float:
+    """Sonde linéaire *rapide* pour la sélection du meilleur epoch pendant le pré-entraînement.
+
+    Encodeur gelé -> features (folds 1-8 sous-échantillonnés) -> tête logistique -> macro-AUROC
+    sur le fold 9 (val). Le fold 10 (test) n'est JAMAIS touché ici : aucune fuite.
+
+    Réentraînée à chaque appel car l'encodeur bouge d'un epoch à l'autre. Coût dominé par le
+    forward d'extraction ; la tête linéaire est négligeable.
+    """
+    Xtr, ytr = extract_features(encoder, "pretrain", device, workers=workers, limit=train_limit)
+    Xva, yva = extract_features(encoder, "val", device, workers=workers)
+    mu, sd = _standardize_fit(Xtr)
+    Xtr, Xva = (Xtr - mu) / sd, (Xva - mu) / sd
+    _, val_auc = train_linear_head(Xtr, ytr, Xva, yva, device)
+    return val_auc
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default=None, help="checkpoint de pré-entraînement")
@@ -104,6 +126,7 @@ def main() -> None:
     if not args.ckpt and not args.random_init:
         ap.error("donne --ckpt, ou --random-init pour la baseline de contrôle")
 
+    from .train import pick_device  # import local : évite le cycle train <-> probe
     device = torch.device(args.device) if args.device else pick_device()
 
     if args.random_init:

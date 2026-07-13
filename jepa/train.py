@@ -5,8 +5,10 @@ Usage :
     python -m jepa.train --config jepa/configs/tiny.yaml --epochs 1 --limit 512   # smoke
     python -m jepa.train --out /content/drive/MyDrive/cjepa/run1 --resume auto    # Colab
 
-Sorties dans <out>/ : metrics.csv (train+val), latest.pt (écrit chaque epoch, pour
-reprendre après une déconnexion Colab) et ckpt_e<N>.pt périodiques.
+Sorties dans <out>/ : metrics.csv (train+val+probe), latest.pt (écrit chaque epoch, pour
+reprendre après une déconnexion Colab) et best.pt (meilleur epoch selon la sonde linéaire
+de sélection, cf. --probe-subsample / --no-probe). Plus de checkpoints périodiques.
+Early stopping sur l'AUROC-sonde (--patience, --min-delta).
 """
 from __future__ import annotations
 
@@ -27,6 +29,7 @@ from .losses import total_loss
 from .masking import MaskCollator, MaskConfig
 from .metrics import collapse_report, is_collapsing
 from .models import ModelConfig
+from .probe import quick_probe_auroc
 
 
 def pick_device() -> torch.device:
@@ -98,6 +101,16 @@ def main() -> None:
                          "reste calculé sur cfg.epochs -> comparaison d'ablation valide.")
     ap.add_argument("--seed", type=int, default=0,
                     help="graine : init des poids, masques, ordre des batches")
+    ap.add_argument("--probe-subsample", type=int, default=4000,
+                    help="nb d'ECG (folds 1-8) pour la sonde de sélection à chaque epoch")
+    ap.add_argument("--no-probe", action="store_true",
+                    help="désactive la sonde de sélection (ne sauve alors que latest.pt)")
+    ap.add_argument("--patience", type=int, default=15,
+                    help="early stopping : arrêt si l'AUROC-sonde ne progresse pas depuis "
+                         "N epochs. 0 = désactivé. Sans effet avec --no-probe.")
+    ap.add_argument("--min-delta", type=float, default=0.0,
+                    help="progression minimale de l'AUROC-sonde comptée comme une amélioration "
+                         "(garde-fou contre le bruit de la sonde)")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -175,9 +188,24 @@ def main() -> None:
                     "scaler": scaler.state_dict(), "epoch": epoch, "step": step,
                     "cfg": cfg}, path)
 
+    def save_best(path: Path, epoch: int, probe_auroc: float) -> None:
+        # Léger : pas d'optimiseur (best.pt sert à l'évaluation aval, pas à reprendre).
+        torch.save({"model": model.state_dict(), "epoch": epoch, "step": step,
+                    "cfg": cfg, "probe_auroc": probe_auroc}, path)
+
+    # Reprise du meilleur score connu : après un redémarrage Colab, ne pas écraser best.pt
+    # avec un epoch moins bon.
+    best_auc, best_epoch = -1.0, -1
+    epochs_no_improve = 0   # compteur d'early stopping (remis à zéro à la reprise)
+    best_path = out_dir / "best.pt"
+    if best_path.exists():
+        prev = torch.load(best_path, map_location="cpu", weights_only=False)
+        best_auc, best_epoch = prev.get("probe_auroc", -1.0), prev.get("epoch", -1)
+        print(f"best.pt existant : epoch {best_epoch}, probe-AUROC {best_auc:.4f}")
+
     HEADER = ["phase", "epoch", "step", "lr", "momentum", "total", "jepa",
               "var", "cov", "emb_std_ctx", "emb_std_tgt", "pred_std",
-              "eff_rank_ctx", "eff_rank_tgt", "r2", "cos"]
+              "eff_rank_ctx", "eff_rank_tgt", "r2", "cos", "probe_auroc"]
     csv_path = out_dir / "metrics.csv"
     append = csv_path.exists() and start_epoch > 0
     if append:
@@ -222,7 +250,7 @@ def main() -> None:
                 writer.writerow(["train", epoch, step, f"{lr:.2e}", f"{m:.5f}",
                                  f"{parts['total']:.4f}", f"{parts['jepa']:.4f}",
                                  f"{parts['var']:.4f}", f"{parts['cov']:.4f}",
-                                 "", "", "", "", "", "", ""])
+                                 "", "", "", "", "", "", "", ""])
                 csv_f.flush()
                 print(f"e{epoch} s{step} lr{lr:.1e} m{m:.4f} "
                       f"L{parts['total']:.3f} jepa{parts['jepa']:.3f} "
@@ -231,30 +259,55 @@ def main() -> None:
 
         # Monitoring collapse sur val en fin d'epoch.
         rep = evaluate(model, val_dl, device, tcfg["val_batches"])
+
+        # Sonde linéaire de sélection : le SEUL critère fiable du meilleur epoch (la loss/R²
+        # JEPA ne mesurent pas la qualité aval). Coûte un forward sur ~probe_subsample ECG.
+        probe_auc = None
+        if not args.no_probe:
+            probe_auc = quick_probe_auroc(model.target_encoder, device,
+                                          train_limit=args.probe_subsample,
+                                          workers=tcfg["num_workers"])
+            model.train()  # extract_features a mis l'encodeur en eval
+
         if rep:
             writer.writerow(["val", epoch, step, "", "", "", "", "", "",
                              f"{rep['emb_std_ctx']:.4f}", f"{rep['emb_std_tgt']:.4f}",
                              f"{rep['pred_std']:.4f}", f"{rep['eff_rank_ctx']:.2f}",
                              f"{rep['eff_rank_tgt']:.2f}", f"{rep['r2']:.4f}",
-                             f"{rep['cos']:.4f}"])
+                             f"{rep['cos']:.4f}",
+                             f"{probe_auc:.4f}" if probe_auc is not None else ""])
             csv_f.flush()
             flag = "  ⚠ COLLAPSE" if is_collapsing(rep) else ""
-            print(f"[val e{epoch}] R2={rep['r2']:.3f} cos={rep['cos']:.3f} | "
+            probe_str = f" | probe-AUROC={probe_auc:.4f}" if probe_auc is not None else ""
+            print(f"[val e{epoch}] R2={rep['r2']:.3f} cos={rep['cos']:.3f}{probe_str} | "
                   f"std ctx={rep['emb_std_ctx']:.3f} tgt={rep['emb_std_tgt']:.3f} "
                   f"pred={rep['pred_std']:.3f} | rang ctx={rep['eff_rank_ctx']:.1f} "
                   f"tgt={rep['eff_rank_tgt']:.1f} ({time.time()-t0:.0f}s){flag}", flush=True)
 
         # latest.pt à chaque epoch : une déconnexion Colab ne coûte qu'une epoch.
         save_ckpt(out_dir / "latest.pt", epoch)
-        if (epoch + 1) % tcfg["ckpt_every"] == 0 or epoch + 1 == tcfg["epochs"]:
-            save_ckpt(out_dir / f"ckpt_e{epoch}.pt", epoch)
+        # best.pt : conservé uniquement quand la sonde s'améliore (plus de checkpoints périodiques).
+        if probe_auc is not None:
+            if probe_auc > best_auc + args.min_delta:
+                best_auc, best_epoch = probe_auc, epoch
+                save_best(best_path, epoch, probe_auc)
+                epochs_no_improve = 0
+                print(f"  -> nouveau best (epoch {epoch}, probe-AUROC {probe_auc:.4f})", flush=True)
+            else:
+                epochs_no_improve += 1
+                # Early stopping : inutile de continuer si la sonde plafonne.
+                if args.patience and epochs_no_improve >= args.patience:
+                    print(f"early stopping : {epochs_no_improve} epochs sans progrès "
+                          f"(best epoch {best_epoch}, probe-AUROC {best_auc:.4f})", flush=True)
+                    break
 
         if args.stop_epoch is not None and epoch >= args.stop_epoch:
-            save_ckpt(out_dir / f"ckpt_e{epoch}.pt", epoch)
             print(f"arrêt demandé après l'epoch {epoch} (--stop-epoch)")
             break
 
     csv_f.close()
+    if best_epoch >= 0:
+        print(f"Meilleur epoch : {best_epoch}  (probe-AUROC {best_auc:.4f})  -> {best_path}")
     print(f"Terminé. Métriques : {csv_path}")
 
 
