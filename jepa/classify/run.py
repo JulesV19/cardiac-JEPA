@@ -21,7 +21,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
 import time
 from pathlib import Path
 
@@ -31,66 +30,14 @@ import torch.nn as nn
 import yaml
 from torch.utils.data import DataLoader, Subset
 
-from .data import SUPERCLASSES, PTBXLDataset
-from .jepa import JEPA
-from .models import ModelConfig
-from .probe import macro_auroc
-from .train import pick_device
-
-
-class ECGClassifier(nn.Module):
-    """Encodeur JEPA -> moyenne des tokens -> tête linéaire multi-label."""
-
-    def __init__(self, encoder: nn.Module, embed_dim: int, n_classes: int):
-        super().__init__()
-        self.encoder = encoder
-        self.head = nn.Linear(embed_dim, n_classes)
-        nn.init.trunc_normal_(self.head.weight, std=0.01)
-        nn.init.zeros_(self.head.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = self.encoder(x, None)          # (B, 480, D), aucun masquage
-        return self.head(z.mean(dim=1))    # (B, n_classes)
-
-
-def labels_of(ds) -> np.ndarray:
-    """Matrice multi-hot (N, 5) d'un PTBXLDataset ou d'un Subset imbriqué.
-
-    Lit `labels` directement : ne charge aucun signal.
-    """
-    if isinstance(ds, Subset):
-        return labels_of(ds.dataset)[np.asarray(ds.indices)]
-    return ds.labels[ds.positions]
-
-
-def build_param_groups(model: ECGClassifier, head_lr: float, encoder_lr: float,
-                       weight_decay: float):
-    """4 groupes : {encodeur, tête} x {avec, sans weight decay}.
-
-    Pas de weight decay sur les params 1D (norms, biais, pos embeds).
-    `base_lr` est mémorisé par groupe : le scheduler applique un multiplicateur commun.
-    """
-    groups = {
-        ("enc", True):  {"params": [], "weight_decay": weight_decay, "base_lr": encoder_lr},
-        ("enc", False): {"params": [], "weight_decay": 0.0,          "base_lr": encoder_lr},
-        ("head", True): {"params": [], "weight_decay": weight_decay, "base_lr": head_lr},
-        ("head", False):{"params": [], "weight_decay": 0.0,          "base_lr": head_lr},
-    }
-    for n, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        part = "head" if n.startswith("head") else "enc"
-        decay = not (p.ndim <= 1 or "pos" in n)
-        groups[(part, decay)]["params"].append(p)
-    return [g for g in groups.values() if g["params"]]
-
-
-def lr_mult(step: int, total: int, warmup: int) -> float:
-    """Multiplicateur de lr : warmup linéaire puis cosine."""
-    if step < warmup:
-        return (step + 1) / max(warmup, 1)
-    prog = (step - warmup) / max(total - warmup, 1)
-    return 0.5 * (1 + math.cos(math.pi * prog))
+from ..data import SUPERCLASSES, PTBXLDataset
+from ..device import pick_device
+from ..jepa import JEPA
+from ..models import ModelConfig
+from ..probe import macro_auroc
+from .labels import labels_of
+from .model import ECGClassifier
+from .schedule import build_param_groups, lr_mult
 
 
 @torch.no_grad()
@@ -106,7 +53,27 @@ def evaluate(model: ECGClassifier, loader, device) -> tuple[float, dict, np.ndar
     return auc, per_class, logits
 
 
-def main() -> None:
+def build_encoder(args) -> tuple[JEPA, str]:
+    """Construit le JEPA (pré-entraîné ou aléatoire iso-architecture) et un tag descriptif."""
+    if args.random_init:
+        # iso-architecture : si un --ckpt est fourni, on reprend SA config (mêmes dims que le
+        # JEPA testé) sans charger les poids. Sinon, défaut ViT-tiny.
+        if args.ckpt:
+            cfg_m = torch.load(args.ckpt, map_location="cpu", weights_only=False)["cfg"]["model"]
+            jepa = JEPA(ModelConfig(**cfg_m))
+            tag = f"random-init iso-archi de {args.ckpt}"
+        else:
+            jepa = JEPA(ModelConfig())
+            tag = "random-init (contrôle, ViT-tiny)"
+    else:
+        ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+        jepa = JEPA(ModelConfig(**ck["cfg"]["model"]))
+        jepa.load_state_dict(ck["model"])
+        tag = f"{args.ckpt} (epoch {ck['epoch']}, encodeur {args.encoder})"
+    return jepa, tag
+
+
+def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default=None, help="checkpoint de pré-entraînement JEPA")
     ap.add_argument("--random-init", action="store_true",
@@ -129,7 +96,11 @@ def main() -> None:
         ap.error("donne --ckpt, ou --random-init pour le contrôle")
     if not 0 < args.train_frac <= 1:
         ap.error("--train-frac doit être dans ]0, 1]")
+    return args
 
+
+def main() -> None:
+    args = parse_args()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -144,21 +115,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Encodeur : pré-entraîné ou aléatoire (même architecture) ---
-    if args.random_init:
-        # iso-architecture : si un --ckpt est fourni, on reprend SA config (mêmes dims que le
-        # JEPA testé) sans charger les poids. Sinon, défaut ViT-tiny.
-        if args.ckpt:
-            cfg_m = torch.load(args.ckpt, map_location="cpu", weights_only=False)["cfg"]["model"]
-            jepa = JEPA(ModelConfig(**cfg_m))
-            tag = f"random-init iso-archi de {args.ckpt}"
-        else:
-            jepa = JEPA(ModelConfig())
-            tag = "random-init (contrôle, ViT-tiny)"
-    else:
-        ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-        jepa = JEPA(ModelConfig(**ck["cfg"]["model"]))
-        jepa.load_state_dict(ck["model"])
-        tag = f"{args.ckpt} (epoch {ck['epoch']}, encodeur {args.encoder})"
+    jepa, tag = build_encoder(args)
     encoder = jepa.target_encoder if args.encoder == "target" else jepa.encoder
     # target_encoder a requires_grad=False (stop-grad du pré-entraînement) : on le dégèle,
     # sinon le « fine-tuning complet » n'entraînerait silencieusement que la tête.
@@ -262,7 +219,3 @@ def main() -> None:
          "test_macro_auroc": test_auc, "test_per_class": test_per_class}, indent=2))
     csv_f.close()
     print(f"\nrésultats -> {out_dir/'result.json'}")
-
-
-if __name__ == "__main__":
-    main()

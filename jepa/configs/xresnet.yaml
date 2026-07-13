@@ -1,0 +1,21 @@
+# Baseline supervisée xresnet1d — point de référence backbone (sans JEPA).
+# La section train: est IDENTIQUE à classify.yaml : on isole l'effet backbone en gardant
+# exactement la recette de fine-tuning du CNN-JEPA (comparaison propre avec le bras aléatoire).
+# Taille calée ISO-CAPACITÉ avec le CNN v2 (6,25M) : sur ~17k échantillons, un xresnet1d101
+# plein (33M) mémoriserait le train et ne serait pas comparable. On teste donc le DESIGN
+# xresnet à capacité égale, pas la reproduction du plafond littérature.
+model:
+  arch: xresnet1d18      # famille : xresnet1d18/34 (basic), xresnet1d50/101 (bottleneck)
+  width_mult: 1.0        # xresnet1d18 w=1.0 = 6,30M (~= CNN v2 6,25M) ; w=0.45 = 1,28M (~= CNN v1)
+  kernel: 5              # kernel des convs (benchmark : 5)
+
+train:
+  batch_size: 128
+  epochs: 30
+  head_lr: 1.0e-3        # tête linéaire
+  encoder_lr: 1.0e-4     # backbone (groupe "enc"). NB: lent pour un from-scratch -> peut sous-apprendre ;
+                         # c'est le prix de "recette identique". Bouton à monter si on passe en mode "plafond".
+  weight_decay: 0.05
+  warmup_frac: 0.1
+  num_workers: 4
+  amp: true

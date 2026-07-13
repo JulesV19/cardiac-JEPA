@@ -13,8 +13,6 @@ Early stopping sur l'AUROC-sonde (--patience, --min-delta).
 from __future__ import annotations
 
 import argparse
-import csv
-import math
 import time
 from pathlib import Path
 
@@ -23,67 +21,21 @@ import torch
 import yaml
 from torch.utils.data import DataLoader, Subset
 
-from .data import PTBXLDataset
-from .jepa import JEPA
-from .losses import total_loss
-from .masking import MaskCollator, MaskConfig
-from .metrics import collapse_report, is_collapsing
-from .models import ModelConfig
-from .probe import quick_probe_auroc
+from ..data import PTBXLDataset
+from ..device import pick_device
+from ..jepa import JEPA
+from ..losses import total_loss
+from ..masking import MaskCollator, MaskConfig
+from ..metrics import is_collapsing
+from ..models import ModelConfig
+from ..probe import quick_probe_auroc
+from .checkpoint import load_best_score, load_resume, save_best, save_ckpt
+from .csvlog import open_metrics_csv
+from .monitor import evaluate
+from .schedule import build_param_groups, lr_at, momentum_at
 
 
-def pick_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def build_param_groups(model: torch.nn.Module, weight_decay: float):
-    """Pas de weight decay sur les params 1D (norms, biais, pos embeds, mask token)."""
-    decay, no_decay = [], []
-    for n, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        if p.ndim <= 1 or "pos" in n or "mask_token" in n:
-            no_decay.append(p)
-        else:
-            decay.append(p)
-    return [{"params": decay, "weight_decay": weight_decay},
-            {"params": no_decay, "weight_decay": 0.0}]
-
-
-def lr_at(step: int, total: int, warmup: int, base_lr: float) -> float:
-    if step < warmup:
-        return base_lr * (step + 1) / max(warmup, 1)
-    prog = (step - warmup) / max(total - warmup, 1)
-    return 0.5 * base_lr * (1 + math.cos(math.pi * prog))
-
-
-def momentum_at(step: int, total: int, m0: float, m1: float) -> float:
-    return m0 + (m1 - m0) * step / max(total - 1, 1)
-
-
-@torch.no_grad()
-def evaluate(model: JEPA, loader, device, n_batches: int) -> dict:
-    model.eval()
-    reps = []
-    for i, batch in enumerate(loader):
-        if i >= n_batches:
-            break
-        sig = batch["signals"].to(device)
-        cidx = batch["context_idx"].to(device)
-        tidx = batch["target_idx"].to(device)
-        pred, z_tgt, z_ctx = model(sig, cidx, tidx)
-        reps.append(collapse_report(z_ctx, z_tgt, pred))
-    model.train()
-    if not reps:
-        return {}
-    return {k: float(np.mean([r[k] for r in reps])) for k in reps[0]}
-
-
-def main() -> None:
+def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="jepa/configs/tiny.yaml")
     ap.add_argument("--epochs", type=int, default=None)
@@ -111,11 +63,10 @@ def main() -> None:
     ap.add_argument("--min-delta", type=float, default=0.0,
                     help="progression minimale de l'AUROC-sonde comptée comme une amélioration "
                          "(garde-fou contre le bruit de la sonde)")
-    args = ap.parse_args()
+    return ap.parse_args()
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
 
+def load_config(args) -> dict:
     cfg = yaml.safe_load(open(args.config))
     tcfg = cfg["train"]
     if args.epochs is not None:
@@ -124,17 +75,21 @@ def main() -> None:
         tcfg["batch_size"] = args.batch_size
     if args.workers is not None:
         tcfg["num_workers"] = args.workers
+    return cfg
 
-    device = torch.device(args.device) if args.device else pick_device()
-    if args.out:
-        out_dir = Path(args.out)
+
+def resolve_out_dir(out_arg) -> Path:
+    if out_arg:
+        out_dir = Path(out_arg)
         if not out_dir.is_absolute():
-            out_dir = Path("runs") / args.out
+            out_dir = Path("runs") / out_arg
     else:
         out_dir = Path("runs") / time.strftime("run_%Y%m%d_%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"device={device}  out={out_dir}")
+    return out_dir
 
+
+def build_loaders(cfg, tcfg, args):
     model_cfg = ModelConfig(**cfg["model"])
     mask_cfg = MaskConfig(grid_h=model_cfg.grid_h, grid_w=model_cfg.grid_w, **cfg["mask"])
 
@@ -154,6 +109,21 @@ def main() -> None:
     val_dl = DataLoader(val_ds, shuffle=False, drop_last=False, **dl_kw)
     if len(val_dl) == 0:
         raise RuntimeError("split val vide : le monitoring anti-collapse serait inactif.")
+    return model_cfg, train_ds, val_ds, train_dl, val_dl
+
+
+def main() -> None:
+    args = parse_args()
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    cfg = load_config(args)
+    tcfg = cfg["train"]
+    device = torch.device(args.device) if args.device else pick_device()
+    out_dir = resolve_out_dir(args.out)
+    print(f"device={device}  out={out_dir}")
+
+    model_cfg, train_ds, val_ds, train_dl, val_dl = build_loaders(cfg, tcfg, args)
 
     model = JEPA(model_cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -170,57 +140,15 @@ def main() -> None:
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     # Reprise après déconnexion (Colab) : modèle + optimiseur + scaler + position.
-    start_epoch, step = 0, 0
-    resume_path = out_dir / "latest.pt" if args.resume == "auto" else (
-        Path(args.resume) if args.resume else None)
-    if resume_path and resume_path.exists():
-        ck = torch.load(resume_path, map_location=device, weights_only=False)
-        model.load_state_dict(ck["model"])
-        opt.load_state_dict(ck["opt"])
-        scaler.load_state_dict(ck["scaler"])
-        start_epoch, step = ck["epoch"] + 1, ck["step"]
-        print(f"reprise depuis {resume_path} : epoch {start_epoch}, step {step}")
-    elif args.resume and args.resume != "auto":
-        raise FileNotFoundError(f"checkpoint introuvable : {resume_path}")
-
-    def save_ckpt(path: Path, epoch: int) -> None:
-        torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
-                    "scaler": scaler.state_dict(), "epoch": epoch, "step": step,
-                    "cfg": cfg}, path)
-
-    def save_best(path: Path, epoch: int, probe_auroc: float) -> None:
-        # Léger : pas d'optimiseur (best.pt sert à l'évaluation aval, pas à reprendre).
-        torch.save({"model": model.state_dict(), "epoch": epoch, "step": step,
-                    "cfg": cfg, "probe_auroc": probe_auroc}, path)
+    start_epoch, step = load_resume(args.resume, out_dir, model, opt, scaler, device)
 
     # Reprise du meilleur score connu : après un redémarrage Colab, ne pas écraser best.pt
     # avec un epoch moins bon.
-    best_auc, best_epoch = -1.0, -1
-    epochs_no_improve = 0   # compteur d'early stopping (remis à zéro à la reprise)
     best_path = out_dir / "best.pt"
-    if best_path.exists():
-        prev = torch.load(best_path, map_location="cpu", weights_only=False)
-        best_auc, best_epoch = prev.get("probe_auroc", -1.0), prev.get("epoch", -1)
-        print(f"best.pt existant : epoch {best_epoch}, probe-AUROC {best_auc:.4f}")
+    best_auc, best_epoch = load_best_score(best_path)
+    epochs_no_improve = 0   # compteur d'early stopping (remis à zéro à la reprise)
 
-    HEADER = ["phase", "epoch", "step", "lr", "momentum", "total", "jepa",
-              "var", "cov", "emb_std_ctx", "emb_std_tgt", "pred_std",
-              "eff_rank_ctx", "eff_rank_tgt", "r2", "cos", "probe_auroc"]
-    csv_path = out_dir / "metrics.csv"
-    append = csv_path.exists() and start_epoch > 0
-    if append:
-        # Si le schéma a changé (nouvelles colonnes), on archive plutôt que de mélanger.
-        with open(csv_path) as f:
-            old = f.readline().strip().split(",")
-        if old != HEADER:
-            backup = csv_path.with_suffix(".prev.csv")
-            csv_path.rename(backup)
-            print(f"schéma CSV modifié -> ancien fichier archivé dans {backup.name}")
-            append = False
-    csv_f = open(csv_path, "a" if append else "w", newline="")
-    writer = csv.writer(csv_f)
-    if not append:
-        writer.writerow(HEADER)
+    csv_f, writer = open_metrics_csv(out_dir / "metrics.csv", resuming=start_epoch > 0)
 
     for epoch in range(start_epoch, tcfg["epochs"]):
         model.train()
@@ -285,12 +213,12 @@ def main() -> None:
                   f"tgt={rep['eff_rank_tgt']:.1f} ({time.time()-t0:.0f}s){flag}", flush=True)
 
         # latest.pt à chaque epoch : une déconnexion Colab ne coûte qu'une epoch.
-        save_ckpt(out_dir / "latest.pt", epoch)
+        save_ckpt(out_dir / "latest.pt", model, opt, scaler, cfg, epoch, step)
         # best.pt : conservé uniquement quand la sonde s'améliore (plus de checkpoints périodiques).
         if probe_auc is not None:
             if probe_auc > best_auc + args.min_delta:
                 best_auc, best_epoch = probe_auc, epoch
-                save_best(best_path, epoch, probe_auc)
+                save_best(best_path, model, cfg, epoch, step, probe_auc)
                 epochs_no_improve = 0
                 print(f"  -> nouveau best (epoch {epoch}, probe-AUROC {probe_auc:.4f})", flush=True)
             else:
@@ -308,8 +236,4 @@ def main() -> None:
     csv_f.close()
     if best_epoch >= 0:
         print(f"Meilleur epoch : {best_epoch}  (probe-AUROC {best_auc:.4f})  -> {best_path}")
-    print(f"Terminé. Métriques : {csv_path}")
-
-
-if __name__ == "__main__":
-    main()
+    print(f"Terminé. Métriques : {out_dir / 'metrics.csv'}")
