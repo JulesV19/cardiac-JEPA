@@ -16,9 +16,15 @@ on peut relancer après une coupure Colab sans rien recalculer. `--dry-run` affi
 from __future__ import annotations
 
 import argparse
+import signal
 import subprocess
 import sys
 from pathlib import Path
+
+# Piper le dry-run vers `head`/`tail` ferme le stdout tôt : rétablir le comportement Unix par
+# défaut (terminer silencieusement) plutôt qu'une BrokenPipeError bruyante.
+if hasattr(signal, "SIGPIPE"):
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
 RUNS = Path("runs")
 CFG = "jepa/configs/{}.yaml"
@@ -97,19 +103,30 @@ def main() -> None:
 
     todo = [(m, c) for m, c in plan if not _skip(m, a.force)]
     done = len(plan) - len(todo)
-    print(f"Plan : {len(plan)} runs ({done} déjà faits, {len(todo)} à lancer)")
-    for m, c in plan:
-        flag = "SKIP" if _skip(m, a.force) else "RUN "
-        print(f"  [{flag}] {' '.join(c[2:])}")
+    print(f"Plan : {len(plan)} runs · {done} déjà faits · {len(todo)} à lancer")
     if a.dry_run:
+        for m, c in plan:
+            flag = "SKIP" if _skip(m, a.force) else "RUN "
+            print(f"  [{flag}] {_name(c)}")
         return
 
+    ok = fail = 0
     for i, (marker, cmd) in enumerate(todo, 1):
-        print(f"\n=== [{i}/{len(todo)}] {' '.join(cmd[2:])} ===", flush=True)
+        print(f"[{i:>3}/{len(todo)}] {_name(cmd)}", flush=True)
         r = subprocess.run(cmd)
-        if r.returncode != 0:
-            print(f"ÉCHEC (code {r.returncode}) — on continue avec le suivant.", flush=True)
-    print("\nCampagne terminée. Agréger : python -m jepa.aggregate")
+        if r.returncode == 0:
+            ok += 1
+        else:
+            fail += 1
+            print(f"   ✗ ÉCHEC (code {r.returncode}) — on continue.", flush=True)
+    print(f"\nTerminé : {ok} ok · {fail} échec(s). Agréger : python -m jepa.aggregate")
+
+
+def _name(cmd) -> str:
+    """Nom lisible d'un run = sa valeur --out (ou la config pour le pretrain)."""
+    if "--out" in cmd:
+        return cmd[cmd.index("--out") + 1]
+    return " ".join(cmd[2:])
 
 
 if __name__ == "__main__":

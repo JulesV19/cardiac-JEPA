@@ -28,6 +28,7 @@ from ..losses import total_loss
 from ..masking import MaskCollator, MaskConfig
 from ..metrics import is_collapsing
 from ..models import ModelConfig
+from ..progress import tqdm
 from ..eval import quick_probe_auroc
 from .checkpoint import load_best_score, load_resume, save_best, save_ckpt
 from .csvlog import open_metrics_csv
@@ -150,9 +151,10 @@ def main() -> None:
 
     csv_f, writer = open_metrics_csv(out_dir / "metrics.csv", resuming=start_epoch > 0)
 
-    for epoch in range(start_epoch, tcfg["epochs"]):
+    pbar = tqdm(range(start_epoch, tcfg["epochs"]), initial=start_epoch,
+                total=tcfg["epochs"], desc=f"{out_dir.parent.name}/{out_dir.name}", unit="ep")
+    for epoch in pbar:
         model.train()
-        t0 = time.time()
         for batch in train_dl:
             lr = lr_at(step, total_steps, warmup, base_lr)
             for g in opt.param_groups:
@@ -180,9 +182,6 @@ def main() -> None:
                                  f"{parts['var']:.4f}", f"{parts['cov']:.4f}",
                                  "", "", "", "", "", "", "", ""])
                 csv_f.flush()
-                print(f"e{epoch} s{step} lr{lr:.1e} m{m:.4f} "
-                      f"L{parts['total']:.3f} jepa{parts['jepa']:.3f} "
-                      f"var{parts['var']:.3f} cov{parts['cov']:.4f}", flush=True)
             step += 1
 
         # Monitoring collapse sur val en fin d'epoch.
@@ -205,12 +204,12 @@ def main() -> None:
                              f"{rep['cos']:.4f}",
                              f"{probe_auc:.4f}" if probe_auc is not None else ""])
             csv_f.flush()
-            flag = "  ⚠ COLLAPSE" if is_collapsing(rep) else ""
-            probe_str = f" | probe-AUROC={probe_auc:.4f}" if probe_auc is not None else ""
-            print(f"[val e{epoch}] R2={rep['r2']:.3f} cos={rep['cos']:.3f}{probe_str} | "
-                  f"std ctx={rep['emb_std_ctx']:.3f} tgt={rep['emb_std_tgt']:.3f} "
-                  f"pred={rep['pred_std']:.3f} | rang ctx={rep['eff_rank_ctx']:.1f} "
-                  f"tgt={rep['eff_rank_tgt']:.1f} ({time.time()-t0:.0f}s){flag}", flush=True)
+            if is_collapsing(rep):
+                tqdm.write(f"  ⚠ COLLAPSE e{epoch} (std ctx={rep['emb_std_ctx']:.3f} "
+                           f"rang={rep['eff_rank_ctx']:.1f})")
+            pbar.set_postfix(probe=f"{probe_auc:.4f}" if probe_auc is not None else "-",
+                             r2=f"{rep['r2']:.2f}", cos=f"{rep['cos']:.2f}",
+                             rank=f"{rep['eff_rank_ctx']:.0f}")
 
         # latest.pt à chaque epoch : une déconnexion Colab ne coûte qu'une epoch.
         save_ckpt(out_dir / "latest.pt", model, opt, scaler, cfg, epoch, step)
@@ -220,20 +219,20 @@ def main() -> None:
                 best_auc, best_epoch = probe_auc, epoch
                 save_best(best_path, model, cfg, epoch, step, probe_auc)
                 epochs_no_improve = 0
-                print(f"  -> nouveau best (epoch {epoch}, probe-AUROC {probe_auc:.4f})", flush=True)
+                tqdm.write(f"  ✓ best e{epoch} probe-AUROC {probe_auc:.4f}")
             else:
                 epochs_no_improve += 1
                 # Early stopping : inutile de continuer si la sonde plafonne.
                 if args.patience and epochs_no_improve >= args.patience:
-                    print(f"early stopping : {epochs_no_improve} epochs sans progrès "
-                          f"(best epoch {best_epoch}, probe-AUROC {best_auc:.4f})", flush=True)
+                    tqdm.write(f"  early-stop e{epoch} : {epochs_no_improve} epochs sans progrès "
+                               f"(best e{best_epoch} = {best_auc:.4f})")
                     break
 
         if args.stop_epoch is not None and epoch >= args.stop_epoch:
-            print(f"arrêt demandé après l'epoch {epoch} (--stop-epoch)")
             break
 
+    pbar.close()
     csv_f.close()
-    if best_epoch >= 0:
-        print(f"Meilleur epoch : {best_epoch}  (probe-AUROC {best_auc:.4f})  -> {best_path}")
-    print(f"Terminé. Métriques : {out_dir / 'metrics.csv'}")
+    tag = f"{out_dir.parent.name}/{out_dir.name}"
+    tqdm.write(f"  {tag}: best e{best_epoch} probe-AUROC {best_auc:.4f} -> {best_path}"
+               if best_epoch >= 0 else f"  {tag}: terminé (pas de sonde)")

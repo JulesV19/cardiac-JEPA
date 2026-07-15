@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import csv
 import json
-import time
 from pathlib import Path
 
 import numpy as np
@@ -19,8 +18,8 @@ from torch.utils.data import DataLoader, Subset
 
 from ..data import SUPERCLASSES, PTBXLDataset
 from ..models import ModelConfig
+from ..progress import tqdm
 from .build import build_jepa
-from .labels import labels_of
 from .metrics import macro_auroc, summarize
 from .model import ECGClassifier
 from .schedule import build_param_groups, lr_mult
@@ -55,8 +54,6 @@ def fit_classifier(model: nn.Module, tag: str, mode: str, cfg: dict, out_dir: Pa
     out_dir.mkdir(parents=True, exist_ok=True)
     model = model.to(device)
     n_par = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"{mode} ({tag}) | device={device} params={n_par/1e6:.2f}M "
-          f"frac={train_frac} seed={seed} -> {out_dir}", flush=True)
 
     dsets = {s: PTBXLDataset(s, with_labels=True, drop_unlabeled=True)
              for s in ("pretrain", "val", "test")}
@@ -67,10 +64,6 @@ def fit_classifier(model: nn.Module, tag: str, mode: str, cfg: dict, out_dir: Pa
         n = max(1, int(round(train_frac * len(train_ds))))
         sel = np.sort(np.random.default_rng(seed).choice(len(train_ds), n, replace=False))
         train_ds = Subset(train_ds, sel.tolist())
-    prev = labels_of(train_ds).sum(0).astype(int)
-    print(f"  train={len(train_ds)} val={len(dsets['val'])} test={len(dsets['test'])} "
-          f"| positifs {dict(zip(SUPERCLASSES, prev.tolist()))}", flush=True)
-
     dl_kw = dict(batch_size=cfg["batch_size"], num_workers=cfg["num_workers"])
     drop = len(train_ds) >= 4 * cfg["batch_size"]
     train_dl = DataLoader(train_ds, shuffle=True, drop_last=drop, **dl_kw)
@@ -92,10 +85,12 @@ def fit_classifier(model: nn.Module, tag: str, mode: str, cfg: dict, out_dir: Pa
     writer = csv.writer(csv_f)
     writer.writerow(["epoch", "step", "train_loss", "val_macro_auroc"] + SUPERCLASSES)
 
+    label = f"{mode[:4]} f{int(round(train_frac*100))} s{seed} ({n_par/1e6:.1f}M)"
     best_auc, best_epoch, step, since = -1.0, -1, 0, 0
-    for epoch in range(cfg["max_epochs"]):
+    pbar = tqdm(range(cfg["max_epochs"]), desc=label, leave=False, unit="ep")
+    for epoch in pbar:
         model.train()
-        t0, losses = time.time(), []
+        losses = []
         for x, y in train_dl:
             for g in opt.param_groups:
                 g["lr"] = g["base_lr"] * lr_mult(step, total_steps, warmup)
@@ -117,19 +112,16 @@ def fit_classifier(model: nn.Module, tag: str, mode: str, cfg: dict, out_dir: Pa
         csv_f.flush()
 
         improved = val_auc > best_auc + cfg.get("min_delta", 0.0)
-        star = ""
         if val_auc > best_auc:                       # on garde le meilleur strict (best.pt)
             best_auc, best_epoch = val_auc, epoch
             torch.save({"model": model.state_dict(), "epoch": epoch, "val_auroc": val_auc,
                         "tag": tag}, out_dir / "best.pt")
-            star = "  <- best"
         since = 0 if improved else since + 1
-        print(f"  e{epoch:<3} loss={np.mean(losses):.4f} val={val_auc:.4f} "
-              f"({time.time()-t0:.0f}s){star}", flush=True)
+        pbar.set_postfix(loss=f"{np.mean(losses):.3f}", val=f"{val_auc:.4f}",
+                         best=f"{best_auc:.4f}@{best_epoch}")
         if since >= cfg["patience"]:
-            print(f"  early-stop : pas d'amélioration >{cfg.get('min_delta',0)} depuis "
-                  f"{cfg['patience']} epochs (meilleur e{best_epoch} = {best_auc:.4f})", flush=True)
             break
+    pbar.close()
 
     best = torch.load(out_dir / "best.pt", map_location=device, weights_only=False)
     model.load_state_dict(best["model"])
@@ -139,7 +131,7 @@ def fit_classifier(model: nn.Module, tag: str, mode: str, cfg: dict, out_dir: Pa
               "best_epoch": best_epoch, "val_macro_auroc": best_auc, **stats}
     (out_dir / "result.json").write_text(json.dumps(result, indent=2))
     csv_f.close()
-    print(f"  TEST macro-AUROC={stats['macro_auroc']:.4f} "
-          f"CI{stats['auroc_ci95']}  AUPRC={stats['macro_auprc']:.4f} -> {out_dir/'result.json'}",
-          flush=True)
+    ci = stats["auroc_ci95"]
+    tqdm.write(f"  {label:28} AUROC {stats['macro_auroc']:.4f} "
+               f"[{ci[0]:.3f},{ci[1]:.3f}]  AUPRC {stats['macro_auprc']:.4f}  (best e{best_epoch})")
     return result

@@ -13,6 +13,7 @@ from pathlib import Path
 import torch
 
 from ..models import ModelConfig
+from ..progress import tqdm
 from .build import build_jepa
 from .features import extract_features, standardize_fit
 from .linear import train_linear_head
@@ -28,7 +29,6 @@ def run_probe(model_cfg: ModelConfig, ckpt, random_init, encoder, out_dir: Path,
     enc = (jepa.target_encoder if encoder == "target" else jepa.encoder).to(device)
     for p in enc.parameters():
         p.requires_grad_(False)                       # gelé
-    print(f"Sonde gelée ({tag}) | device={device} seed={seed} -> {out_dir}", flush=True)
 
     kw = dict(workers=workers, limit=limit)
     Xtr, ytr = extract_features(enc, "pretrain", device, **kw)
@@ -45,6 +45,7 @@ def run_probe(model_cfg: ModelConfig, ckpt, random_init, encoder, out_dir: Path,
     result = {"tag": tag, "mode": "probe", "seed": seed,
               "val_macro_auroc": val_auc, **stats}
     (out_dir / "result.json").write_text(json.dumps(result, indent=2))
-    print(f"  TEST macro-AUROC={stats['macro_auroc']:.4f} CI{stats['auroc_ci95']} "
-          f"AUPRC={stats['macro_auprc']:.4f} -> {out_dir/'result.json'}", flush=True)
+    ci = stats["auroc_ci95"]
+    tqdm.write(f"  probe s{seed:<2} {'':18} AUROC {stats['macro_auroc']:.4f} "
+               f"[{ci[0]:.3f},{ci[1]:.3f}]  AUPRC {stats['macro_auprc']:.4f}")
     return result
