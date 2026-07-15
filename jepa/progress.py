@@ -1,8 +1,14 @@
 """Barre de progression partagée : tqdm si dispo, sinon un repli silencieux minimal.
 
 Évite les logs verbeux par epoch : on affiche une barre unique qui se met à jour en place.
+Filtre aussi le warning DataLoader « create N worker processes » qui, réémis à chaque epoch,
+casse le retour-chariot de la barre (elle semble se dupliquer).
 """
 from __future__ import annotations
+
+import warnings
+
+warnings.filterwarnings("ignore", message="This DataLoader will create")
 
 try:
     from tqdm.auto import tqdm

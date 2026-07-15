@@ -16,5 +16,5 @@ eval:
   patience: 6
   min_delta: 0.001
   n_boot: 2000
-  num_workers: 4
+  num_workers: 2
   amp: true

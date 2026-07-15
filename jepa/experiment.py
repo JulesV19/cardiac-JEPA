@@ -38,7 +38,8 @@ def _skip(marker: Path, force: bool) -> bool:
     return marker.exists() and not force
 
 
-def build_plan(backbones, arms, fracs, ft_seeds, probe_seeds, steps):
+def build_plan(backbones, arms, fracs, ft_seeds, probe_seeds, steps,
+               pre_patience=15, pre_min_delta=0.003):
     """Retourne la liste des (marker, cmd) à exécuter, dans l'ordre pretrain -> probe -> ft -> sup."""
     plan = []
     py = [sys.executable]
@@ -47,7 +48,8 @@ def build_plan(backbones, arms, fracs, ft_seeds, probe_seeds, steps):
         for bb in backbones:
             marker = RUNS / bb / "pretrain" / "best.pt"
             cmd = py + ["-m", "jepa.train", "--config", CFG.format(bb),
-                        "--out", f"{bb}/pretrain", "--resume", "auto"]
+                        "--out", f"{bb}/pretrain", "--resume", "auto",
+                        "--patience", str(pre_patience), "--min-delta", str(pre_min_delta)]
             plan.append((marker, cmd))
 
     def eval_cmd(bb, mode, arm_flag, out, extra):
@@ -91,6 +93,11 @@ def main() -> None:
     ap.add_argument("--seeds", default="0,1,2,3,4", help="graines du fine-tuning/supervisé")
     ap.add_argument("--probe-seeds", default="0,1,2")
     ap.add_argument("--steps", default="pretrain,probe,finetune,supervised")
+    ap.add_argument("--pretrain-patience", type=int, default=15,
+                    help="early-stopping du pré-entraînement : epochs sans gain de sonde avant arrêt")
+    ap.add_argument("--pretrain-min-delta", type=float, default=0.003,
+                    help="gain minimal de sonde comptant comme amélioration (0.003 : la sonde plafonne "
+                         "dans le bruit, un min_delta trop bas ne stoppe jamais)")
     ap.add_argument("--force", action="store_true", help="recalcule même si le résultat existe")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
@@ -99,7 +106,7 @@ def main() -> None:
         a.backbones.split(","), a.arms.split(","),
         [float(x) for x in a.fracs.split(",")],
         [int(x) for x in a.seeds.split(",")], [int(x) for x in a.probe_seeds.split(",")],
-        set(a.steps.split(",")))
+        set(a.steps.split(",")), a.pretrain_patience, a.pretrain_min_delta)
 
     todo = [(m, c) for m, c in plan if not _skip(m, a.force)]
     done = len(plan) - len(todo)

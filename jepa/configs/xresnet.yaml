@@ -31,7 +31,7 @@ train:
   lambda_cov: 0.04
   ema_start: 0.996
   ema_end: 1.0
-  num_workers: 4
+  num_workers: 2
   amp: true
   log_every: 20
   val_batches: 8
@@ -47,5 +47,5 @@ eval:                      # partagé par les 3 backbones (recette de fine-tunin
   patience: 6              # early-stopping sur val macro-AUROC
   min_delta: 0.001
   n_boot: 2000             # rééchantillonnages bootstrap pour les IC test
-  num_workers: 4
+  num_workers: 2
   amp: true
