@@ -1,0 +1,20 @@
+# Référence « meilleure recette » : xresnet1d supervisé BatchNorm, from-scratch, SANS JEPA.
+# Design faithful du benchmark (BN+ReLU). Sert de ligne séparée (hors grille SSL, qui est
+# GroupNorm iso-archi). Iso-capacité CNN v2 (xresnet1d18 w=1.0 = 6,30 M).
+model:
+  arch: xresnet1d18
+  width_mult: 1.0
+  kernel: 5
+
+eval:
+  batch_size: 128
+  max_epochs: 40
+  head_lr: 1.0e-3
+  encoder_lr: 1.0e-4
+  weight_decay: 0.05
+  warmup_frac: 0.1
+  patience: 6
+  min_delta: 0.001
+  n_boot: 2000
+  num_workers: 4
+  amp: true

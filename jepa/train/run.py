@@ -28,7 +28,7 @@ from ..losses import total_loss
 from ..masking import MaskCollator, MaskConfig
 from ..metrics import is_collapsing
 from ..models import ModelConfig
-from ..probe import quick_probe_auroc
+from ..eval import quick_probe_auroc
 from .checkpoint import load_best_score, load_resume, save_best, save_ckpt
 from .csvlog import open_metrics_csv
 from .monitor import evaluate

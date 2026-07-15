@@ -1,21 +1,51 @@
-# Baseline supervisée xresnet1d — point de référence backbone (sans JEPA).
-# La section train: est IDENTIQUE à classify.yaml : on isole l'effet backbone en gardant
-# exactement la recette de fine-tuning du CNN-JEPA (comparaison propre avec le bras aléatoire).
-# Taille calée ISO-CAPACITÉ avec le CNN v2 (6,25M) : sur ~17k échantillons, un xresnet1d101
-# plein (33M) mémoriserait le train et ne serait pas comparable. On teste donc le DESIGN
-# xresnet à capacité égale, pas la reproduction du plafond littérature.
+# Backbone xresnet branché au JEPA (GroupNorm). Iso-capacité ~6,4 M (design xresnet1d18 w=1.0).
+# Sections : model/mask/train = pré-entraînement JEPA (python -m jepa.train) ;
+#            eval = sonde + fine-tuning (python -m jepa.eval).
 model:
-  arch: xresnet1d18      # famille : xresnet1d18/34 (basic), xresnet1d50/101 (bottleneck)
-  width_mult: 1.0        # xresnet1d18 w=1.0 = 6,30M (~= CNN v2 6,25M) ; w=0.45 = 1,28M (~= CNN v1)
-  kernel: 5              # kernel des convs (benchmark : 5)
+  encoder_type: xresnet
+  grid_h: 1                # 12 dérivations = CANAUX ; grille de tokens 1x40
+  grid_w: 40
+  patch_len: 25
+  embed_dim: 256
+  xr_arch: xresnet1d18     # basic [2,2,2,2] ; 34/50/101 dispo
+  xr_width_mult: 1.0       # w=1.0 -> encodeur ~6,4 M (~CNN v2 6,25 M)
+  xr_kernel: 5
+  # predictor (transformer, bottleneck ~embed/2)
+  pred_dim: 128
+  pred_depth: 6
+  pred_heads: 4
+
+mask:
+  num_target_blocks: 3
+  target_scale: [0.10, 0.18]
+  target_aspect: [0.10, 0.25]
+  min_context_tokens: 8
 
 train:
-  batch_size: 128
-  epochs: 30
-  head_lr: 1.0e-3        # tête linéaire
-  encoder_lr: 1.0e-4     # backbone (groupe "enc"). NB: lent pour un from-scratch -> peut sous-apprendre ;
-                         # c'est le prix de "recette identique". Bouton à monter si on passe en mode "plafond".
+  batch_size: 256
+  epochs: 100
+  base_lr: 1.5e-4
   weight_decay: 0.05
   warmup_frac: 0.1
+  lambda_var: 1.0
+  lambda_cov: 0.04
+  ema_start: 0.996
+  ema_end: 1.0
+  num_workers: 4
+  amp: true
+  log_every: 20
+  val_batches: 8
+  ckpt_every: 20
+
+eval:                      # partagé par les 3 backbones (recette de fine-tuning identique)
+  batch_size: 128
+  max_epochs: 40
+  head_lr: 1.0e-3
+  encoder_lr: 1.0e-4
+  weight_decay: 0.05
+  warmup_frac: 0.1
+  patience: 6              # early-stopping sur val macro-AUROC
+  min_delta: 0.001
+  n_boot: 2000             # rééchantillonnages bootstrap pour les IC test
   num_workers: 4
   amp: true

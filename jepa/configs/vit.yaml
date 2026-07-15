@@ -1,24 +1,23 @@
-# Backbone CNN (ConvEncoder, GroupNorm) branché au JEPA — iso-capacité ~6,25 M (ex « v2 »).
+# Backbone ViT-tiny branché au JEPA. Grille 12 dérivations × 40 patches temporels (~6,0 M).
 # Sections : model/mask/train = pré-entraînement JEPA ; eval = sonde + fine-tuning.
 model:
-  encoder_type: cnn
-  grid_h: 1                # 12 dérivations = CANAUX ; grille de tokens 1x40
+  encoder_type: vit
+  grid_h: 12
   grid_w: 40
   patch_len: 25
-  embed_dim: 256
-  cnn_channels: [96, 192, 384]
-  cnn_blocks_per_stage: 2
-  cnn_strides: [5, 5, 1]   # produit = 25 -> 40 tokens
-  cnn_kernel: 7
-  pred_dim: 128
+  embed_dim: 192
+  depth: 12
+  heads: 3
+  mlp_ratio: 4.0
+  pred_dim: 96
   pred_depth: 6
-  pred_heads: 4
+  pred_heads: 3
 
 mask:
-  num_target_blocks: 3
-  target_scale: [0.10, 0.18]
-  target_aspect: [0.10, 0.25]
-  min_context_tokens: 8
+  num_target_blocks: 4
+  target_scale: [0.15, 0.20]
+  target_aspect: [0.5, 2.0]
+  min_context_tokens: 48
 
 train:
   batch_size: 256

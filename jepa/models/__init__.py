@@ -21,6 +21,7 @@ from .config import ModelConfig, build_tiny
 from .layers import Block
 from .predictor import Predictor
 from .vit import Encoder, PatchEmbed
+from .xresnet_encoder import XResNetEncoder
 
 __all__ = [
     "ModelConfig",
@@ -28,6 +29,7 @@ __all__ = [
     "Encoder",
     "PatchEmbed",
     "ConvEncoder",
+    "XResNetEncoder",
     "Predictor",
     "Block",
 ]

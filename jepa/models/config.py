@@ -17,12 +17,16 @@ class ModelConfig:
     pred_depth: int = 6
     pred_heads: int = 3
 
-    encoder_type: str = "vit"           # "vit" (défaut) ou "cnn"
-    # --- hyperparams encodeur CNN (ignorés si encoder_type == "vit") ---
+    encoder_type: str = "vit"           # "vit" (défaut), "cnn" ou "xresnet"
+    # --- hyperparams encodeur CNN (ignorés si encoder_type != "cnn") ---
     cnn_channels: tuple = (64, 128)     # canaux de sortie par étage
     cnn_blocks_per_stage: int = 2       # blocs résiduels par étage
     cnn_strides: tuple = (5, 5)         # produit = downsample temporel (5*5=25 -> 1000/25=40)
     cnn_kernel: int = 7
+    # --- hyperparams encodeur xresnet (ignorés si encoder_type != "xresnet") ---
+    xr_arch: str = "xresnet1d18"        # xresnet1d18/34 (basic), 50/101 (bottleneck)
+    xr_width_mult: float = 1.0          # scale toutes les largeurs (cale la capacité)
+    xr_kernel: int = 5                  # kernel des convs (benchmark : 5)
 
     @property
     def num_tokens(self) -> int:

@@ -13,7 +13,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .models import ConvEncoder, Encoder, ModelConfig, Predictor
+from .models import ConvEncoder, Encoder, ModelConfig, Predictor, XResNetEncoder
+
+_ENCODERS = {"vit": Encoder, "cnn": ConvEncoder, "xresnet": XResNetEncoder}
 
 
 def _zero_target_patches(signals: torch.Tensor, target_idx: torch.Tensor,
@@ -36,7 +38,7 @@ class JEPA(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
-        enc_cls = ConvEncoder if cfg.encoder_type == "cnn" else Encoder
+        enc_cls = _ENCODERS[cfg.encoder_type]
         self.encoder = enc_cls(cfg)                       # online
         self.predictor = Predictor(cfg)
         self.target_encoder = copy.deepcopy(self.encoder)  # cible EMA
@@ -56,8 +58,9 @@ class JEPA(nn.Module):
     def forward(self, signals: torch.Tensor, context_idx: torch.Tensor,
                 target_idx: torch.Tensor):
         # Branche online : contexte -> predictor -> prédiction des cibles.
-        # CNN : input-masking (contexte aveugle) ; ViT : l'encodeur jette déjà les tokens cibles.
-        if self.cfg.encoder_type == "cnn":
+        # Conv-family (cnn/xresnet) : input-masking (contexte aveugle) ; ViT : l'encodeur jette
+        # déjà les tokens cibles.
+        if self.cfg.encoder_type != "vit":
             signals_ctx = _zero_target_patches(signals, target_idx, self.cfg.patch_len)
         else:
             signals_ctx = signals

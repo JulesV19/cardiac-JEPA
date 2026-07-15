@@ -22,7 +22,7 @@ def train_linear_head(Xtr, ytr, Xva, yva, device, epochs=100, lr=1e-3,
 
     best = (-1.0, None)
     n = len(Xtr_t)
-    for ep in range(epochs):
+    for _ in range(epochs):
         head.train()
         perm = torch.randperm(n, device=device)
         for i in range(0, n, batch_size):
@@ -40,14 +40,11 @@ def train_linear_head(Xtr, ytr, Xva, yva, device, epochs=100, lr=1e-3,
 
 
 def quick_probe_auroc(encoder: nn.Module, device, train_limit: int = 4000,
-                      workers: int = 2) -> float:
+                      workers: int = 0) -> float:
     """Sonde linéaire *rapide* pour la sélection du meilleur epoch pendant le pré-entraînement.
 
     Encodeur gelé -> features (folds 1-8 sous-échantillonnés) -> tête logistique -> macro-AUROC
     sur le fold 9 (val). Le fold 10 (test) n'est JAMAIS touché ici : aucune fuite.
-
-    Réentraînée à chaque appel car l'encodeur bouge d'un epoch à l'autre. Coût dominé par le
-    forward d'extraction ; la tête linéaire est négligeable.
     """
     Xtr, ytr = extract_features(encoder, "pretrain", device, workers=workers, limit=train_limit)
     Xva, yva = extract_features(encoder, "val", device, workers=workers)
