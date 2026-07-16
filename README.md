@@ -131,6 +131,7 @@ repère** supervisé de zéro (BatchNorm, archi + norme différentes) — hors p
 
 ## Limites
 
+- **Il s'agit d'un benchmark pas parfaitement adapté à une architecture de type JEPA.** On voit bien que le modèle overfit le train, et que ce type de données ne contient peut-être pas assez de bruit à filtrer.
 - **Un seul pré-entraînement JEPA par backbone** (coût Colab). Les IC et les t inter-graines
   portent sur le fine-tuning / la sonde à **encodeur figé** ; ils **ne mesurent pas** la variance de
   pré-entraînement.
