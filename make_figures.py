@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""Génère les figures du README depuis runs/ (régénérable à l'identique).
+"""Génère les figures du README depuis runs/results.json (+ les metrics.csv).
 
-Toutes les valeurs sont lues des result.json / metrics.csv réels — aucun chiffre codé en dur.
-Métrique : macro-AUROC, test = fold 10 (jamais vu), sélection d'epoch sur fold 9.
+Source unique = l'agrégat produit par `python -m jepa.aggregate` (moyennes ± écart-type
+inter-graines, écarts pairés JEPA−scratch + t de Student). Aucun chiffre codé en dur.
+Barres d'erreur = écart-type inter-graines. Défensif : saute proprement ce qui manque.
 
     python make_figures.py
-
-Sortie : figures/*.png + figures/_summary.json (récapitulatif des chiffres tracés).
 """
 import json
 import glob
 import os
-from collections import defaultdict
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -24,11 +23,14 @@ RUNS = "runs"
 OUT = "figures"
 os.makedirs(OUT, exist_ok=True)
 
-# ---- palette CVD-safe (validée) ----
+# ---- palette CVD-safe ----
 SURF, INK, INK2, MUTED, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#898781", "#e1e0d9"
-ARM = {"random": "#eb6834", "jepa": "#2a78d6"}          # aléatoire / pré-entraîné
-MODEL = {"ViT": "#4a3aa7", "CNN v1": "#199e70", "CNN v2": "#2a78d6", "xresnet": "#c81e5a"}
-EMBED = {"ViT": 192, "CNN v1": 192, "CNN v2": 256}
+ARM = {"scratch": "#eb6834", "jepa": "#2a78d6"}
+BBCOL = {"vit": "#4a3aa7", "cnn": "#199e70", "xresnet": "#c81e5a"}
+EMBED = {"vit": 192, "cnn": 256, "xresnet": 256}
+BBNAME = {"vit": "ViT-tiny", "cnn": "CNN", "xresnet": "xresnet"}
+BACKBONES = ["vit", "cnn", "xresnet"]
+FRACS = [("ft1", 1), ("ft5", 5), ("ft10", 10), ("ft100", 100)]
 
 plt.rcParams.update({
     "figure.facecolor": SURF, "axes.facecolor": SURF, "savefig.facecolor": SURF,
@@ -40,17 +42,18 @@ plt.rcParams.update({
     "axes.titlesize": 13, "axes.titleweight": "bold", "figure.dpi": 150,
 })
 
-
-def res(run):
-    return json.load(open(f"{RUNS}/{run}/result.json"))["test_macro_auroc"]
-
-
-def per_class(run):
-    return json.load(open(f"{RUNS}/{run}/result.json"))["test_per_class"]
+RES = json.load(open(f"{RUNS}/results.json"))
+CELLS, GAPS = RES["cells"], RES["paired_gaps"]
 
 
-def probe(run, kind):
-    return json.load(open(f"{RUNS}/{run}/probe_{kind}.json"))["test_macro_auroc"]
+def cell(bb, arm, reg):
+    return CELLS.get(f"{bb}|{arm}|{reg}")
+
+
+def val(bb, arm, reg, metric="auroc"):
+    """(mean, sd) inter-graines, ou (None, None) si absent."""
+    c = cell(bb, arm, reg)
+    return (c[metric]["mean"], c[metric]["sd"]) if c else (None, None)
 
 
 def finish(fig, name):
@@ -61,195 +64,297 @@ def finish(fig, name):
 
 
 # =========================================================================
-# Données (toutes lues des runs)
+# FIG 1 — Plafond 100 % : AUROC + AUPRC, scratch vs JEPA + xresnet BN supervisé
 # =========================================================================
-CEIL = {  # fine-tuning 100 % des labels
-    "ViT":    {"random": res("clf_random"),        "jepa": res("clf_jepa")},
-    "CNN v1": {"random": res("clf_cnn_random"),    "jepa": res("clf_cnn_jepa")},
-    "CNN v2": {"random": res("clf_cnn_v2_random"), "jepa": res("clf_cnn_v2_jepa")},
-}
-XRES = res("xresnet18")                                     # from-scratch, sans SSL
-PARAMS = {"ViT": 6.0, "CNN v1": 1.27, "CNN v2": 6.25, "xresnet": 6.30}
-
-# sonde linéaire (features gelées) — le probe ViT vit dans le _summary du rapport CNN
-PROBE = {
-    "ViT":    {"random": 0.7825071583381865, "jepa": 0.8436695846387587},
-    "CNN v2": {"random": probe("cnn_v2", "random"), "jepa": probe("cnn_v2", "cnn")},
-}
-
-SWEEP_DIR = {"ViT": "lowlabel", "CNN v1": "lowlabel_cnn", "CNN v2": "lowlabel_cnn_v2"}
-FRAC_TAGS = [("0.01", 1), ("0.05", 5), ("0.1", 10), ("1.0", 100)]
-
-
-def sweep(model):
-    d = defaultdict(lambda: defaultdict(list))
-    base = SWEEP_DIR[model]
-    for ftag, pct in FRAC_TAGS:
-        for arm in ("random", "jepa"):
-            for p in sorted(glob.glob(f"{RUNS}/{base}/{arm}_f{ftag}_s*/result.json")):
-                d[pct][arm].append(json.load(open(p))["test_macro_auroc"])
-    return d
+def _ceiling(ax, metric, title):
+    x = np.arange(len(BACKBONES))
+    w = 0.34
+    for k, arm in enumerate(("scratch", "jepa")):
+        means = [val(bb, arm, "ft100", metric)[0] for bb in BACKBONES]
+        sds = [val(bb, arm, "ft100", metric)[1] for bb in BACKBONES]
+        ax.bar(x + (k - 0.5) * w, [m or 0 for m in means], w,
+               yerr=[s or 0 for s in sds], capsize=3, color=ARM[arm],
+               label="aléatoire" if arm == "scratch" else "JEPA")
+    # référence xresnet BN supervisé (hors grille SSL)
+    sup = val("xresnet_bn", "supervised", "ft100", metric)
+    if sup[0] is not None:
+        ax.axhline(sup[0], color=INK, ls="--", lw=1.2)
+        ax.text(len(BACKBONES) - 0.5, sup[0], f" xresnet BN {sup[0]:.3f}",
+                color=INK, fontsize=8, va="bottom", ha="right")
+    ax.set_xticks(x); ax.set_xticklabels([BBNAME[b] for b in BACKBONES])
+    ax.set_ylabel(f"macro-{metric.upper()} (test)")
+    ax.set_title(title)
+    lo = min([v for b in BACKBONES for a in ("scratch", "jepa")
+              for v in [val(b, a, "ft100", metric)[0]] if v is not None] or [0.5])
+    ax.set_ylim(max(0, lo - 0.03), None)
 
 
-SW = {m: sweep(m) for m in SWEEP_DIR}
-
-
-# =========================================================================
-# FIG 1 — Le levier, c'est le backbone (plafond 100 %, 4 backbones)
-# =========================================================================
-fig, ax = plt.subplots(figsize=(8.4, 3.8))
-order = ["ViT", "CNN v1", "CNN v2"]
-for i, m in enumerate(order):
-    r, j = CEIL[m]["random"], CEIL[m]["jepa"]
-    ax.plot([r, j], [i, i], color=MUTED, lw=2, zorder=1)
-    ax.scatter([r], [i], s=95, color=ARM["random"], zorder=3)
-    ax.scatter([j], [i], s=95, color=ARM["jepa"], zorder=3)
-    ax.annotate(f"{r:.3f}", (r, i), textcoords="offset points", xytext=(0, -15),
-                ha="center", color=ARM["random"], fontsize=9)
-    ax.annotate(f"{j:.3f}", (j, i), textcoords="offset points", xytext=(0, 9),
-                ha="center", color=ARM["jepa"], fontsize=9, fontweight="bold")
-# xresnet : from-scratch (aucun SSL) — un seul point, la meilleure valeur du projet
-yx = len(order)
-ax.scatter([XRES], [yx], s=130, marker="D", color=MODEL["xresnet"], zorder=4)
-ax.annotate(f"{XRES:.3f}", (XRES, yx), textcoords="offset points", xytext=(0, 10),
-            ha="center", color=MODEL["xresnet"], fontsize=10, fontweight="bold")
-labels = [f"{m}\n{PARAMS[m]:.2f} M" for m in order] + [f"xresnet1d18\n{PARAMS['xresnet']:.2f} M · sans SSL"]
-ax.set_yticks(range(len(order) + 1)); ax.set_yticklabels(labels)
-ax.set_ylim(-0.5, yx + 0.75); ax.set_xlim(0.855, 0.90)
-ax.set_xlabel("macro-AUROC (test, fold 10)")
-ax.set_title("Fine-tuning 100 % des labels — macro-AUROC test par backbone")
-ax.grid(axis="y", visible=False)
-ax.legend(handles=[Line2D([0], [0], marker="o", ls="", color=ARM["random"], label="aléatoire (from-scratch)"),
-                   Line2D([0], [0], marker="o", ls="", color=ARM["jepa"], label="pré-entraîné JEPA"),
-                   Line2D([0], [0], marker="D", ls="", color=MODEL["xresnet"], label="xresnet (from-scratch)")],
-          loc="lower right", frameon=False, fontsize=9)
+fig, (a1, a2) = plt.subplots(1, 2, figsize=(11, 4.2))
+_ceiling(a1, "auroc", "macro-AUROC")
+_ceiling(a2, "auprc", "macro-AUPRC")
+a1.legend(frameon=False, loc="upper left", fontsize=9)
+fig.suptitle("Plafond à 100 % des labels (fine-tuné, 5 graines ± écart-type)",
+             fontsize=13, fontweight="bold", color=INK, y=1.03)
 finish(fig, "1_backbone")
 
 # =========================================================================
-# FIG 2 — Sonde gelée : le SSL marche (sur les features, avant fine-tuning)
+# FIG 2 — Sonde gelée : SSL sur les représentations (scratch vs JEPA)
 # =========================================================================
-fig, ax = plt.subplots(figsize=(8, 2.9))
-mods = ["ViT", "CNN v2"]
-for i, m in enumerate(mods):
-    r, j = PROBE[m]["random"], PROBE[m]["jepa"]
+fig, ax = plt.subplots(figsize=(8, 3.4))
+present = [b for b in BACKBONES if cell(b, "jepa", "probe")]
+y = np.arange(len(present))
+for i, bb in enumerate(present):
+    r = val(bb, "scratch", "probe")[0]
+    j = val(bb, "jepa", "probe")[0]
+    if r is None or j is None:
+        continue
     ax.plot([r, j], [i, i], color=MUTED, lw=2, zorder=1)
-    ax.scatter([r], [i], s=95, color=ARM["random"], zorder=3)
-    ax.scatter([j], [i], s=95, color=ARM["jepa"], zorder=3)
+    ax.scatter([r], [i], s=90, color=ARM["scratch"], zorder=3)
+    ax.scatter([j], [i], s=90, color=ARM["jepa"], zorder=3)
     ax.annotate(f"{r:.3f}", (r, i), textcoords="offset points", xytext=(0, -15),
-                ha="center", color=ARM["random"], fontsize=9)
+                ha="center", color=ARM["scratch"], fontsize=9)
     ax.annotate(f"{j:.3f}", (j, i), textcoords="offset points", xytext=(0, 9),
                 ha="center", color=ARM["jepa"], fontsize=9, fontweight="bold")
-    ax.annotate(f"+{j-r:.3f}", (j, i), textcoords="offset points", xytext=(28, 0),
+    ax.annotate(f"+{j-r:.3f}", (j, i), textcoords="offset points", xytext=(30, 0),
                 va="center", color=INK, fontsize=10, fontweight="bold")
-ax.set_yticks(range(len(mods))); ax.set_yticklabels(mods)
-ax.set_ylim(-0.6, len(mods) - 0.3); ax.set_xlim(0.75, 0.87)
+ax.set_yticks(y); ax.set_yticklabels([BBNAME[b] for b in present])
 ax.set_xlabel("macro-AUROC (test) — sonde linéaire sur encodeur gelé")
 ax.set_title("Sonde linéaire sur encodeur gelé")
 ax.grid(axis="y", visible=False)
-ax.legend(handles=[Line2D([0], [0], marker="o", ls="", color=ARM["random"], label="encodeur aléatoire"),
-                   Line2D([0], [0], marker="o", ls="", color=ARM["jepa"], label="encodeur JEPA")],
+ax.legend(handles=[Line2D([0], [0], marker="o", ls="", color=ARM["scratch"], label="aléatoire"),
+                   Line2D([0], [0], marker="o", ls="", color=ARM["jepa"], label="JEPA")],
           loc="lower right", frameon=False, fontsize=9)
 finish(fig, "2_probe")
 
 # =========================================================================
-# FIG 3 — Peu-de-labels : le SSL prouve sa valeur (CNN v2)
+# FIG 3 — Peu-de-labels : AUROC vs %labels, 3 backbones (couleur) × arm (style) ± sd
 # =========================================================================
-fig, ax = plt.subplots(figsize=(7.5, 4.4))
-sw = SW["CNN v2"]
-pcts = [1, 5, 10, 100]
-for arm in ("random", "jepa"):
-    means = [np.mean(sw[p][arm]) for p in pcts]
-    stds = [np.std(sw[p][arm], ddof=1) if len(sw[p][arm]) > 1 else 0 for p in pcts]
-    ax.errorbar(pcts, means, yerr=stds, marker="o", ms=7, lw=2, capsize=3,
-                color=ARM[arm])
-    ax.annotate(("aléatoire" if arm == "random" else "JEPA"), (pcts[-1], means[-1]),
-                textcoords="offset points", xytext=(8, 8 if arm == "jepa" else -8),
-                color=ARM[arm], fontsize=10, fontweight="bold", va="center")
+fig, ax = plt.subplots(figsize=(8, 4.8))
+pcts = [p for _, p in FRACS]
+for bb in BACKBONES:
+    for arm, ls in (("jepa", "-"), ("scratch", "--")):
+        ms = [val(bb, arm, reg)[0] for reg, _ in FRACS]
+        ss = [val(bb, arm, reg)[1] for reg, _ in FRACS]
+        if any(m is None for m in ms):
+            continue
+        ax.errorbar(pcts, ms, yerr=[s or 0 for s in ss], marker="o", ms=5, lw=2, ls=ls,
+                    capsize=2.5, color=BBCOL[bb])
 ax.set_xscale("log"); ax.set_xticks(pcts); ax.set_xticklabels([f"{p}%" for p in pcts])
 ax.set_xlabel("part des labels d'entraînement (échelle log)")
 ax.set_ylabel("macro-AUROC (test)")
-ax.set_title("CNN v2 — macro-AUROC test vs part des labels")
-ax.set_xlim(0.8, 200)
+ax.set_title("macro-AUROC test vs part des labels — 3 backbones")
+ax.set_xlim(0.8, 160)
+bb_h = [Line2D([0], [0], color=BBCOL[b], lw=2, label=BBNAME[b]) for b in BACKBONES]
+st_h = [Line2D([0], [0], color=INK2, lw=2, ls="-", label="JEPA"),
+        Line2D([0], [0], color=INK2, lw=2, ls="--", label="aléatoire")]
+ax.legend(handles=bb_h + st_h, frameon=False, fontsize=9, loc="lower right", ncol=2)
 finish(fig, "3_lowlabel")
 
 # =========================================================================
-# FIG 4 — Le gain SSL s'efface quand les labels abondent (écart pairé, 3 modèles)
+# FIG 4 — Écart pairé JEPA − scratch vs %labels, 3 backbones (± sd, t annoté)
 # =========================================================================
 fig, ax = plt.subplots(figsize=(7.5, 4.4))
-for m in ["ViT", "CNN v1", "CNN v2"]:
-    sw = SW[m]
-    gaps = []
-    for p in pcts:
-        r, j = sw[p]["random"], sw[p]["jepa"]
-        n = min(len(r), len(j))
-        gaps.append(np.mean(np.array(j[:n]) - np.array(r[:n])))
-    ax.plot(pcts, gaps, marker="o", ms=7, lw=2, color=MODEL[m], label=m)
+for bb in BACKBONES:
+    xs, ys, es = [], [], []
+    for reg, p in FRACS:
+        g = GAPS.get(f"{bb}|{reg}")
+        if g:
+            xs.append(p); ys.append(g["mean"]); es.append(g["sd"])
+    if not xs:
+        continue
+    ax.errorbar(xs, ys, yerr=es, marker="o", ms=6, lw=2, capsize=3,
+                color=BBCOL[bb], label=BBNAME[bb])
 ax.axhline(0, color=MUTED, lw=1, ls="--")
-ax.set_xscale("log"); ax.set_xticks(pcts); ax.set_xticklabels([f"{p}%" for p in pcts])
+ax.set_xscale("log"); ax.set_xticks([p for _, p in FRACS])
+ax.set_xticklabels([f"{p}%" for _, p in FRACS])
 ax.set_xlabel("part des labels d'entraînement (échelle log)")
 ax.set_ylabel("écart JEPA − aléatoire (macro-AUROC)")
-ax.set_title("Écart JEPA − aléatoire vs part des labels")
+ax.set_title("Écart pairé JEPA − aléatoire vs part des labels")
 ax.set_xlim(0.8, 160)
-ax.legend(handles=[Line2D([0], [0], color=MODEL[m], lw=2, label=m) for m in ["ViT", "CNN v1", "CNN v2"]],
-          loc="upper right", frameon=False)
+ax.legend(frameon=False, loc="upper right")
 finish(fig, "4_ssl_gain")
 
 # =========================================================================
-# FIG 5 — Pré-entraînement : encodeur sain (pas de collapse) vs prédicteur qui régresse
+# FIG 5 — Diagnostics anti-collapse : VICReg (var, cov) + rang + std + cos + pred/tgt
 # =========================================================================
-fig, (a1, a2) = plt.subplots(1, 2, figsize=(11, 4.2))
-runs = {"ViT": "tiny_v1", "CNN v1": "cnn_v1", "CNN v2": "cnn_v2"}
-for m, run in runs.items():
-    df = pd.read_csv(f"{RUNS}/{run}/metrics.csv")
-    va = df[df.phase == "val"]
-    a1.plot(va.epoch, va.eff_rank_ctx / EMBED[m], color=MODEL[m], lw=2, label=m)
-    a2.plot(va.epoch, va.cos, color=MODEL[m], lw=2, label=m)
-a1.set_title("Rang effectif normalisé (contexte)")
-a1.set_xlabel("epoch"); a1.set_ylabel("rang effectif / dim")
-a1.set_ylim(0, 1); a1.legend(frameon=False, loc="lower right")
-a2.set_title("cos(prédiction, cible)")
-a2.set_xlabel("epoch"); a2.set_ylabel("cos")
-a2.legend(frameon=False, loc="upper right")
-fig.suptitle("Pré-entraînement JEPA (suivi sur fold 9)",
-             fontsize=12, fontweight="bold", color=INK, y=1.02)
+PRE = {}
+for bb in BACKBONES:
+    p = f"{RUNS}/{bb}/pretrain/metrics.csv"
+    if os.path.exists(p):
+        PRE[bb] = pd.read_csv(p)
+
+fig, axs = plt.subplots(2, 3, figsize=(13.5, 7.2))
+(ax_var, ax_cov, ax_cos), (ax_std, ax_rank, ax_pred) = axs
+
+for bb, df in PRE.items():
+    tr, va = df[df.phase == "train"], df[df.phase == "val"]
+    c = BBCOL[bb]
+    ax_var.plot(tr.step, tr["var"], color=c, lw=2, label=BBNAME[bb])
+    ax_cov.plot(tr.step, tr["cov"], color=c, lw=2)
+    ax_cos.plot(va.epoch, va.cos, color=c, lw=2)
+    ax_std.plot(va.epoch, va.emb_std_ctx, color=c, lw=2, ls="-")
+    ax_std.plot(va.epoch, va.emb_std_tgt, color=c, lw=1.5, ls="--")
+    ax_rank.plot(va.epoch, va.eff_rank_ctx / EMBED[bb], color=c, lw=2, ls="-")
+    ax_rank.plot(va.epoch, va.eff_rank_tgt / EMBED[bb], color=c, lw=1.5, ls="--")
+    ax_pred.plot(va.epoch, va.pred_std, color=c, lw=2, ls="-")
+    ax_pred.plot(va.epoch, va.emb_std_tgt, color=c, lw=1.5, ls="--")
+
+ax_var.set_title("VICReg — terme de variance")
+ax_var.set_xlabel("step"); ax_var.set_ylabel("var  (hinge max(0, 1−std))")
+ax_var.axhline(0, color=MUTED, lw=1, ls=":")
+
+ax_cov.set_title("VICReg — terme de covariance")
+ax_cov.set_xlabel("step"); ax_cov.set_ylabel("cov  (redondance)")
+
+ax_cos.set_title("cos(prédiction, cible)")
+ax_cos.set_xlabel("epoch"); ax_cos.set_ylabel("cos")
+
+ax_std.set_title("Écart-type des embeddings")
+ax_std.set_xlabel("epoch"); ax_std.set_ylabel("std moyen par dim")
+ax_std.axhline(1.0, color=MUTED, lw=1, ls=":")
+
+ax_rank.set_title("Rang effectif normalisé")
+ax_rank.set_xlabel("epoch"); ax_rank.set_ylabel("rang effectif / dim"); ax_rank.set_ylim(0, 1)
+
+ax_pred.set_title("Écart-type : prédiction vs cible")
+ax_pred.set_xlabel("epoch"); ax_pred.set_ylabel("std moyen par dim")
+
+# légendes : couleurs backbones (une fois) + clé style contexte/cible
+ax_var.legend(frameon=False, loc="upper right", fontsize=9)
+style = [Line2D([0], [0], color=INK2, lw=2, ls="-", label="contexte / prédiction"),
+         Line2D([0], [0], color=INK2, lw=1.5, ls="--", label="cible")]
+ax_rank.legend(handles=style, frameon=False, loc="lower right", fontsize=8)
+fig.suptitle("Pré-entraînement JEPA — diagnostics anti-collapse (suivi fold 9)",
+             fontsize=13, fontweight="bold", color=INK, y=1.0)
 finish(fig, "5_pretraining")
 
 # =========================================================================
-# FIG 6 — Le mur = généralisation, pas capacité (val pique tôt puis chute)
+# FIG 5b — Progression du pré-entraînement : loss JEPA + sonde macro-AUROC in-loop
 # =========================================================================
 fig, (a1, a2) = plt.subplots(1, 2, figsize=(11, 4.2))
-CURVES = [("ViT", "clf_jepa", MODEL["ViT"]),
-          ("CNN v1", "clf_cnn_jepa", MODEL["CNN v1"]),
-          ("CNN v2", "clf_cnn_v2_jepa", MODEL["CNN v2"]),
-          ("xresnet", "xresnet18", MODEL["xresnet"])]
-for lbl, run, c in CURVES:
-    df = pd.read_csv(f"{RUNS}/{run}/metrics.csv")
-    a1.plot(df.epoch, df.val_macro_auroc, color=c, lw=2, label=lbl)
+for bb, df in PRE.items():
+    tr, va = df[df.phase == "train"], df[df.phase == "val"]
+    a1.plot(tr.step, tr["total"], color=BBCOL[bb], lw=2, label=BBNAME[bb])
+    pa = va.dropna(subset=["probe_auroc"])
+    a2.plot(pa.epoch, pa["probe_auroc"], color=BBCOL[bb], lw=2, label=BBNAME[bb])
+a1.set_title("Loss d'entraînement JEPA")
+a1.set_xlabel("step"); a1.set_ylabel("loss totale")
+a2.set_title("Sonde macro-AUROC (in-loop, fold 9)")
+a2.set_xlabel("epoch"); a2.set_ylabel("macro-AUROC")
+a2.legend(frameon=False, loc="lower right")
+fig.suptitle("Pré-entraînement JEPA — loss et AUROC mesurées pendant l'entraînement",
+             fontsize=13, fontweight="bold", color=INK, y=1.02)
+finish(fig, "5b_pretrain_progress")
+
+# =========================================================================
+# FIG 6 — Généralisation : val AUROC + train loss vs epoch (ft100, graine 0)
+# =========================================================================
+fig, (a1, a2) = plt.subplots(1, 2, figsize=(11, 4.2))
+any_ft = False
+for bb in BACKBONES:
+    p = f"{RUNS}/{bb}/jepa/ft100/s0/metrics.csv"
+    if not os.path.exists(p):
+        continue
+    df = pd.read_csv(p)
+    any_ft = True
+    a1.plot(df.epoch, df.val_macro_auroc, color=BBCOL[bb], lw=2, label=BBNAME[bb])
     be = int(df.val_macro_auroc.idxmax())
-    a1.scatter([df.epoch.iloc[be]], [df.val_macro_auroc.iloc[be]], s=90, color=c,
-               edgecolor=SURF, linewidth=1.5, zorder=5)
-    a2.plot(df.epoch, df.train_loss, color=c, lw=2, label=lbl)
+    a1.scatter([df.epoch.iloc[be]], [df.val_macro_auroc.iloc[be]], s=80,
+               color=BBCOL[bb], edgecolor=SURF, linewidth=1.5, zorder=5)
+    a2.plot(df.epoch, df.train_loss, color=BBCOL[bb], lw=2, label=BBNAME[bb])
 a1.set_title("val macro-AUROC (point = meilleur epoch)")
 a1.set_xlabel("epoch de fine-tuning"); a1.set_ylabel("val macro-AUROC")
-a1.legend(frameon=False, loc="lower left", fontsize=9)
 a2.set_title("train loss")
 a2.set_xlabel("epoch de fine-tuning"); a2.set_ylabel("train loss")
-a2.legend(frameon=False, loc="upper right", fontsize=9)
-fig.suptitle("Fine-tuning 100 % des labels — courbes d'entraînement",
-             fontsize=13, fontweight="bold", color=INK, y=1.04)
+if any_ft:
+    a1.legend(frameon=False, loc="lower right", fontsize=9)
+fig.suptitle("Fine-tuning 100 % — courbes d'entraînement (graine 0)",
+             fontsize=13, fontweight="bold", color=INK, y=1.03)
 finish(fig, "6_generalization")
 
 # =========================================================================
-# Récapitulatif chiffré
+# FIG 7 — F1 vs seuil de décision : chaque backbone comparé à SA version from-scratch
+#   (iso-architecture), à 1 % et 5 % des labels. Bandes = moyenne ± écart-type sur les
+#   graines. Couleur = régime (1 % / 5 %), trait plein = JEPA / tireté = supervisé.
+#   UNE figure par backbone. Défensif : backbone sauté si ses thresholds.json manquent.
 # =========================================================================
-summary = {
-    "ceiling_100pct": {m: CEIL[m] for m in CEIL},
-    "xresnet_fromscratch": XRES,
-    "probe_frozen": PROBE,
-    "sweep_mean": {m: {p: {a: float(np.mean(SW[m][p][a])) for a in SW[m][p]} for p in [1, 5, 10, 100]}
-                   for m in SW},
-    "per_class_xresnet": per_class("xresnet18"),
-}
-json.dump(summary, open(f"{OUT}/_summary.json", "w"), indent=2)
-print("\nécrit", f"{OUT}/_summary.json")
-print(f"\nxresnet1d18 from-scratch = {XRES:.4f} (meilleur test du projet)")
+C1, C5 = "#d1495b", "#2a78d6"                     # 1 % (rouge), 5 % (bleu)
+
+
+def _agg_seeds(dirrel):
+    """Agrège toutes les graines d'un modèle : moyenne + écart-type des courbes par τ."""
+    files = sorted(glob.glob(f"{RUNS}/{dirrel}/s*/thresholds.json"))
+    ms = [json.load(open(f)) for f in files]
+    if not ms:
+        return None
+    panels = [c for c in ms[0]["classes"] if c in ms[0]["curves"]] + ["macro"]
+    out = {"taus": ms[0]["thresholds"], "panels": panels, "n": len(ms),
+           "mean": {}, "sd": {}, "prev": {}}
+    for name in panels:
+        out["mean"][name], out["sd"][name] = {}, {}
+        prevs = [m["curves"].get(name, {}).get("prevalence") for m in ms]
+        prevs = [p for p in prevs if p is not None]
+        out["prev"][name] = float(np.mean(prevs)) if prevs else None
+        for metric in ("sensitivity", "specificity", "precision", "f1"):
+            stack = [m["curves"][name][metric] for m in ms
+                     if m["curves"].get(name) and metric in m["curves"][name]]
+            if not stack:
+                continue
+            arr = np.array(stack, dtype=float)          # (graines, τ)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                out["mean"][name][metric] = np.nanmean(arr, axis=0)
+                out["sd"][name][metric] = np.nanstd(arr, axis=0)
+    return out
+
+
+def _seuil_sel(bb):
+    """(agg, couleur, style) pour JEPA/scratch × 1%/5% du backbone bb, si dispo."""
+    spec = [(f"{bb}/jepa/ft1", C1, "-"), (f"{bb}/scratch/ft1", C1, "--"),
+            (f"{bb}/jepa/ft5", C5, "-"), (f"{bb}/scratch/ft5", C5, "--")]
+    return [(a, col, ls) for dirrel, col, ls in spec
+            if (a := _agg_seeds(dirrel)) is not None]
+
+
+for bb in BACKBONES:
+    SEL = _seuil_sel(bb)
+    if not SEL:
+        print(f"(FIG 7 {bb} sautée : thresholds.json 1%/5% absents.)")
+        continue
+    panels = SEL[0][0]["panels"]
+    nseed = max(a["n"] for a, *_ in SEL)
+    ncol = 3
+    nrow = int(np.ceil(len(panels) / ncol))
+    fig, axs = plt.subplots(nrow, ncol, figsize=(4.6 * ncol, 3.3 * nrow), squeeze=False)
+    for k, name in enumerate(panels):
+        ax = axs[k // ncol][k % ncol]
+        for a, col, ls in SEL:
+            mu = a["mean"].get(name, {}).get("f1")
+            sd = a["sd"].get(name, {}).get("f1")
+            if mu is None:
+                continue
+            taus = np.array(a["taus"])
+            if sd is not None and a["n"] > 1:           # bande ± écart-type inter-graines
+                ax.fill_between(taus, mu - sd, mu + sd, color=col, alpha=0.15, lw=0)
+            ax.plot(taus, mu, color=col, ls=ls, lw=2.0, alpha=0.98)
+        prev = SEL[0][0]["prev"].get(name)
+        ax.set_title(name + (f"  (prév. {prev:.0%})" if prev is not None else ""),
+                     fontsize=11)
+        ax.set_xlim(0, 1); ax.set_ylim(0, 1.02)
+        ax.set_xlabel("seuil de décision τ")
+        if k % ncol == 0:
+            ax.set_ylabel("F1")
+    for k in range(len(panels), nrow * ncol):
+        axs[k // ncol][k % ncol].axis("off")
+    reg_h = [Line2D([0], [0], color=C1, lw=2.4, label="1 % des labels"),
+             Line2D([0], [0], color=C5, lw=2.4, label="5 % des labels")]
+    arm_h = [Line2D([0], [0], color=INK2, lw=2, ls="-", label="JEPA (pré-entraîné)"),
+             Line2D([0], [0], color=INK2, lw=2, ls="--", label="supervisé (scratch)")]
+    axs[0][0].legend(handles=reg_h, frameon=False, fontsize=8, loc="lower left")
+    axs[0][-1].legend(handles=arm_h, frameon=False, fontsize=8, loc="upper right")
+    fig.suptitle(f"F1 selon le seuil τ — {BBNAME[bb]} : JEPA vs supervisé (scratch) en "
+                 f"peu-de-labels (test, moyenne ± écart-type, {nseed} graines)",
+                 fontsize=13, fontweight="bold", color=INK, y=1.0)
+    finish(fig, f"7_seuil_f1_{bb}")
+
+print("\nFigures générées dans", OUT)

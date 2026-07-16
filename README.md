@@ -1,160 +1,165 @@
 # Cardiac JEPA — auto-supervision par prédiction latente sur ECG (PTB-XL)
 
 Un **JEPA** (Joint-Embedding Predictive Architecture) qui prédit les *embeddings* de zones
-masquées d'un ECG puis un classifieur d'anomalies par-dessus. On mesure ce
-que le pré-entraînement apporte, et on le confronte à des baselines supervisées à capacité égale.
+masquées d'un ECG — pas le signal en mV — puis un classifieur d'anomalies par-dessus. On mesure
+ce que le pré-entraînement apporte, sur **trois familles de backbone à capacité égale** (~6 M),
+et on le confronte à une baseline supervisée pure.
 
-**Dataset.** PTB-XL — 21 837 ECG, 12 dérivations, 10 s, 100 Hz, 5 super-classes (NORM, MI, STTC, CD,
-HYP), multi-label. **Métrique : macro-AUROC.** Splits standards : pré-entraînement folds 1-8,
-sélection d'epoch sur fold 9, **test sur le fold 10** (jamais vu). Tous les chiffres ci-dessous sont
-en **test / fold 10**.
+**Dataset.** PTB-XL — 21 837 ECG, 12 dérivations, 10 s, 100 Hz, 5 super-classes (NORM, MI, STTC,
+CD, HYP), multi-label.
+
+**Protocole unique** : pré-entraînement folds 1-8, sélection d'epoch sur
+fold 9, **test sur le fold 10** (jamais vu). Chaque point d'évaluation est **répété sur 5 graines**
+(3 pour la sonde), métriques **macro-AUROC + macro-AUPRC** avec
+intervalles de confiance bootstrap. Baseline aléatoire toujours **iso-architecture**. Tous les
+chiffres ci-dessous sont en **test / fold 10**, moyenne ± écart-type inter-graines.
 
 ---
-
 ## Résultats en bref
 
-1. **Le JEPA apprend de vraies représentations.** Sur encodeur **gelé**, une sonde linéaire passe de
-   0,78 (encodeur aléatoire) à **0,84** — soit **+0,06 à +0,08** sans aucun label pendant le
-   pré-entraînement. Pas de *collapse*.
-2. **Mais le fine-tuning complet efface ce gain.** À 100 % des labels, l'écart JEPA − aléatoire tombe
-   à **~0** (+0,004 à +0,009). La valeur du SSL est **en régime peu-de-labels**, où elle est
-   statistiquement établie (5 graines à 1 % / 5 %).
-3. **Le levier dominant à pleine supervision, c'est le *design* du backbone — pas la taille.** À
-   capacité égale, un **xresnet1d18 from-scratch (0,894)** fait aussi bien ou mieux que le meilleur
-   CNN pré-entraîné JEPA (0,888) : le design (ResNet-D) relève le plafond ~0,88 → ~0,90, tandis
-   qu'agrandir un CNN de 1,27 M à 6,25 M **ne le monte pas**. Le frein restant est la
-   **généralisation** sur 17 k ECG, pas la capacité. *(Réserve : l'écart xresnet↔CNN-JEPA n'est que
-   de +0,005 à une seule graine, dans le bruit plausible ; et le xresnet n'a pas été pré-entraîné, donc
-   backbone et SSL ne sont pas comparés à isopérimètre.)*
+1. **Le JEPA apprend une représentation.** Sur encodeur **gelé**, une sonde linéaire gagne
+   **+0,035 à +0,062** de macro-AUROC vs un encodeur aléatoire sans label d'entraînement.
+2. **Le SSL aide surtout en peu-de-labels — et inégalement selon l'architecture.** En AUROC, l'écart JEPA−aléatoire décroît de **+0,07** (1 %) à **~0** (100 %). En décision (F1), le gain est fiable à 5 % sur les trois backbones ; à 1 %, **seul le ViT** en profite, les backbones convolutifs étant noyés dans la variance de graine.
+3. **À pleine supervision, le JEPA n'apporte rien de significatif.** À titre de **comparaison** un xresnet1d supervisé de bout en bout (BatchNorm, ~6 M) atteint 0,897. Il diffère des bras JEPA par l'architecture **et** la normalisation (BN vs GroupNorm).
 
 ---
 
-## 1 · Le pré-entraînement JEPA est sain
+## 1 · Pré-entraînement sain
 
 ![Pré-entraînement](figures/5_pretraining.png)
 
-L'encodeur **ne s'effondre pas** : le rang effectif monte et se stabilise haut (les modèles utilisent
-la majeure partie de leurs dimensions). Le **prédicteur**, lui, retombe dans une **régression vers la
-moyenne** (le cosinus prédiction↔cible culmine tôt puis décline) — un plateau *intrinsèque au
-prédicteur sous incertitude*, identique sur ViT et CNN, et **sans conséquence** : la détection lit les
-embeddings de l'encodeur (sains), jamais la prédiction.
+Grâce notamment à la normalisation VICReg, l'entraînement est stable et utilise bien les dimensions allouées. La loss cosinus montre que la prédiction remonte certainement légèrement vers la moyenne, sans conséquences puisque macro-AUROC continue d'augmenter.
+
+![Progression du pré-entraînement — loss JEPA et sonde macro-AUROC in-loop](figures/5b_pretrain_progress.png)
+
+La sonde in-loop (macro-AUROC sur fold 9, encodeur gelé) **monte de ~0,75 à ~0,84** au fil du
+pré-entraînement, pendant que la loss JEPA descend : la représentation s'améliore réellement,
+sans aucun label. **Cette figure permet de voir qu'il faut ajuster les réglages d'early stopping pour permettre d'atteindre la convergence macro-AUROC (en cours).**
 
 ## 2 · Sur features gelées, le SSL fonctionne
 
 ![Sonde gelée](figures/2_probe.png)
 
-Encodeur gelé, sonde linéaire entraînée par-dessus. Le pré-entraînement apporte un gain net et
-reproductible sur les deux familles de backbone.
+Encodeur gelé, sonde linéaire. Le pré-entraînement apporte un gain sur les trois
+backbones.
 
 | sonde linéaire (gelé) | aléatoire | JEPA | écart |
 |---|---:|---:|---:|
-| ViT-tiny | 0,7825 | **0,8437** | **+0,061** |
-| CNN v2 | 0,7623 | **0,8413** | **+0,079** |
+| ViT-tiny | 0,7742 | **0,8363** | **+0,062** |
+| CNN | 0,7813 | **0,8397** | **+0,058** |
+| xresnet | 0,7976 | **0,8321** | **+0,035** |
 
-## 3 · Peu-de-labels : là où le SSL prouve sa valeur
+## 3 · Peu-de-labels : ce que le pré-entraînement apporte
+
+Le vrai intérêt du JEPA est là. On fine-tune chaque backbone sur 1 %, 5 %, 10 % puis 100 % des
+labels, avec et sans pré-entraînement (même architecture, même norme).
 
 ![Peu de labels](figures/3_lowlabel.png)
 
-À 1 % des labels (~171 ECG), le pré-entraînement fait gagner jusqu'à **+0,066** (ViT) ; l'écart
-rétrécit à mesure que les labels arrivent. Les écarts à 1 % et 5 % sont **pairés par graine sur 5
-graines** et **excluent zéro** (t ≈ 6 à 1 %, t ≈ 14–21 à 5 %) — c'est un effet, pas du bruit.
-Efficacité-label ~2 à 5× : JEPA à 1 % ≈ aléatoire à 5 %.
+En **AUROC**, le pré-entraînement fait gagner jusqu'à **+0,07** à 1 % ; l'écart rétrécit quand les
+labels arrivent, et s'annule à 100 %.
 
-![Le gain SSL s'efface](figures/4_ssl_gain.png)
+![Écart pairé](figures/4_ssl_gain.png)
 
-Même **forme monotone décroissante** pour les trois modèles, jusqu'à ~0 à 100 %. Le gain SSL est
-**systématiquement plus petit sur CNN** que sur ViT : le bon biais inductif du CNN capte déjà une
-partie de ce que l'auto-supervision apportait au transformer.
-
-| écart JEPA − aléatoire | 1 % | 5 % | 10 % | 100 % |
+| écart JEPA − aléatoire (AUROC) | 1 % | 5 % | 10 % | 100 % |
 |---|---:|---:|---:|---:|
-| ViT | +0,066 | +0,037 | +0,025 | +0,003 |
-| CNN v1 | +0,038 | +0,029 | +0,021 | +0,007 |
-| CNN v2 | +0,052 | +0,025 | +0,015 | +0,004 |
+| ViT | +0,071 *(t 7,1)* | +0,029 *(t 16)* | +0,017 *(t 9,7)* | +0,001 *(ns)* |
+| CNN | +0,031 *(t 9,6)* | +0,019 *(t 8,6)* | +0,020 *(t 12)* | +0,006 *(t 4,7)* |
+| xresnet | +0,047 *(t 4,1)* | +0,011 *(t 16)* | +0,010 *(t 3,6)* | −0,002 *(ns)* |
 
-## 4 · Le design du backbone relève le plafond
+*(t = statistique de Student sur l'écart pairé, 5 graines. ns = non significatif.)*
 
-![Backbone](figures/1_backbone.png)
+### En décision (F1), le gain dépend de l'architecture
 
-À 100 % des labels (fine-tuné), le **CNN bat le ViT** des deux côtés (aléatoire *et* JEPA, écart
-~+0,01–0,02), et un **xresnet1d18 from-scratch atteint 0,894** — le meilleur score du projet, **sans
-aucun pré-entraînement** (mais à +0,005 du meilleur CNN-JEPA, sur une seule graine : au niveau, pas une
-domination établie). Deux enseignements francs :
+L'AUROC mesure le **classement**, sans seuil. Pour la **décision**, on balaye le seuil τ et on lit
+le **F1** — chaque backbone contre sa version supervisée de zéro (même archi), moyenne ± écart-type
+sur 5 graines.
 
-- **La capacité n'est pas le levier.** Le CNN v2 (6,25 M) ne bat pas le CNN v1 (1,27 M) au plafond.
-- **Le *design* du backbone, si.** xresnet (ResNet-D, stem 3-convs) relève le plafond ~0,88 → ~0,90 à
-  capacité égale.
+![F1 vs seuil — ViT](figures/7_seuil_f1_vit.png)
+![F1 vs seuil — CNN](figures/7_seuil_f1_cnn.png)
+![F1 vs seuil — xresnet](figures/7_seuil_f1_xresnet.png)
 
-| plafond 100 % (fine-tuné) | params | aléatoire | JEPA |
-|---|---:|---:|---:|
-| ViT-tiny | 6,0 M | 0,8657 | 0,8748 |
-| CNN v1 | 1,27 M | 0,8817 | **0,8884** |
-| CNN v2 | 6,25 M | 0,8789 | 0,8826 |
-| **xresnet1d18** *(sans SSL)* | 6,30 M | **0,8936** | — |
+| F1-max macro (5 graines) | JEPA 1 % | scratch 1 % | JEPA 5 % | scratch 5 % |
+|---|---:|---:|---:|---:|
+| ViT | **0,558** ±0,010 | 0,481 ±0,039 | **0,589** | 0,562 |
+| CNN | 0,451 ±0,062 | **0,493** ±0,044 | **0,623** | 0,601 |
+| xresnet | 0,506 ±0,074 | **0,527** ±0,022 | **0,626** | 0,608 |
 
-## 5 · Le mur est la généralisation, pas la capacité
+- **À 5 %, gain petit mais fiable sur les trois backbones**.
+- **À 1 %, seul le ViT profite** (**+0,077**, et plus stable). Pour CNN et xresnet, le JEPA n'est
+  **pas meilleur en F1**.
+- Le SSL améliore donc le **classement** (AUROC) même à 1 %, mais pour les conv nets ça **ne se
+  traduit pas en meilleure décision** (F1) : la calibration reste trop instable.
+
+
+## 4 · Point de repère : où plafonne-t-on à 100 % des labels
+
+![Plafond](figures/1_backbone.png)
+
+À 100 % des labels (fine-tuné), les trois encodeurs JEPA (GroupNorm) plafonnent autour de
+**0,87-0,88**, et le SSL n'y ajoute **rien de significatif**.
+
+Pour situer ces chiffres, un **xresnet1d supervisé de bout en bout (BatchNorm, ~6 M) atteint 0,897**.
+
+| plafond 100 % (fine-tuné) | aléatoire | JEPA |
+|---|---:|---:|
+| ViT-tiny | 0,8696 ±0,003 | 0,8701 ±0,002 |
+| CNN | 0,8774 ±0,003 | **0,8833** ±0,000 |
+| xresnet (GroupNorm) | 0,8833 ±0,003 | 0,8813 ±0,002 |
+| *repère supervisé — xresnet (BatchNorm)* | *0,8974 ±0,001* | *—* |
+
+## 5 · Le vrai frein : la généralisation
 
 ![Généralisation](figures/6_generalization.png)
 
-En fine-tuning, la val-AUROC **pique vers l'epoch 6-10 puis décline** pendant que la train-loss tend
-vers 0 : **sur-apprentissage** franc sur 17 k ECG. Preuve mécanistique : le petit **CNN v1 est
-incapable de fitter le train** (loss bloquée ~0,18) et atteint pourtant **le même pic** que le CNN v2
-qui, lui, **mémorise** le train (loss ~0,015). Fitter davantage le train ne monte pas le plafond —
-c'est la généralisation qui bloque, pas les paramètres.
-
----
+En fine-tuning, la val-AUROC **pique vers l'epoch 6-11 puis décline** pendant que la train-loss tend
+vers 0 : **overfitting** sur 17 k ECG. Cela contribue certainement grandement au plafond des scores.
 
 ## Récapitulatif complet (macro-AUROC test)
 
-| régime | ViT (6 M) | CNN v1 (1,27 M) | CNN v2 (6,25 M) | xresnet (6,30 M) |
+| régime | ViT | CNN | xresnet (GN) | xresnet BN *(repère)* |
 |---|---:|---:|---:|---:|
-| Sonde linéaire (gelé) | 0,8437 | 0,8167 | 0,8413 | — |
-| Fine-tuné 1 % | 0,7798 | 0,7780 | 0,8109 | — |
-| Fine-tuné 5 % | 0,8170 | 0,8241 | 0,8457 | — |
-| Fine-tuné 10 % | 0,8317 | 0,8527 | 0,8584 | — |
-| Fine-tuné 100 % | 0,8748 | **0,8884** | 0,8826 | **0,8936** |
+| Sonde gelée | 0,8363 | 0,8397 | 0,8321 | — |
+| Fine-tuné 1 % | 0,7850 | 0,7987 | 0,8108 | 0,7865 |
+| Fine-tuné 5 % | 0,8142 | 0,8431 | 0,8424 | 0,8477 |
+| Fine-tuné 10 % | 0,8282 | 0,8542 | 0,8526 | 0,8631 |
+| Fine-tuné 100 % | 0,8701 | **0,8833** | 0,8813 | **0,8974** |
 
-*(colonnes ViT/CNN : bras JEPA pré-entraîné ; xresnet : supervisé from-scratch.)*
+*Trois premières colonnes : encodeurs JEPA (GroupNorm), bras SSL. Dernière colonne : **point de
+repère** supervisé de zéro (BatchNorm, archi + norme différentes) — hors protocole de comparaison SSL.*
 
-## Positionnement honnête vs littérature
-
-- La **SOTA supervisée** sur PTB-XL superdiagnostic (~0,93 ; resnet1d_wang, xresnet1d101) s'entraîne
-  **et** teste sur **les mêmes splits que nous**. L'écart nous↔0,93 est donc **archi + recette**
-  (augmentation de données, design CNN dédié, résolution 500 Hz ?), **pas les données**.
-- Les papiers **JEPA-ECG** (~0,92 linéaire) **pré-entraînent sur des corpus externes >100 k–1 M ECG**
-  puis PTB-XL — **non comparables** à notre SSL entraîné sur les **17 k de PTB-XL seulement**. Notre
-  +0,06 en sonde depuis 17 k-seulement est en ce sens un résultat solide.
 
 ## Limites
 
-- AUROC de rang **uniquement** — pas de seuils ni de calibration.
-- Barres d'erreur multi-graines seulement à 1 % et 5 % ; **10 % et 100 % à une seule graine** — les
-  écarts fins au plafond (dont xresnet +0,005 vs CNN-JEPA) ne sont donc **pas** statistiquement établis.
-- Backbone et SSL **non croisés** : le xresnet n'a jamais été pré-entraîné en JEPA. On mesure l'effet
-  *design de backbone* et l'effet *SSL* sur des backbones différents, pas l'un contre l'autre.
-- Le xresnet est mesuré à sa taille iso-capacité (6,30 M), pas au xresnet1d101 plein (33 M, qui
-  mémoriserait ~17 k échantillons) : on teste le **design**, pas la reproduction du 0,93.
+- **Un seul pré-entraînement JEPA par backbone** (coût Colab). Les IC et les t inter-graines
+  portent sur le fine-tuning / la sonde à **encodeur figé** ; ils **ne mesurent pas** la variance de
+  pré-entraînement.
+- Le **repère supervisé BatchNorm (0,897)** n'est **pas** une comparaison contrôlée du SSL : il
+  change à la fois d'architecture et de norme et n'a pas de bras JEPA.
+- Analyse par seuil (F1 vs τ) **balayée sur le test** : le « F1-max » est donc un **seuil-oracle**
+  (borne supérieure de décision), et **aucun seuil validé ni calibration** clinique n'est fourni —
+  les points de fonctionnement restent à choisir sur la validation.
 
 ---
 
 ## Reproduire
 
 ```bash
-# Pré-entraînement JEPA (ViT ou CNN)
-python -m jepa.train --config jepa/configs/tiny.yaml       # ViT
-python -m jepa.train --config jepa/configs/cnn_v2.yaml     # CNN
+# Pré-entraînement JEPA (un backbone)
+python -m jepa.train --config jepa/configs/{vit,cnn,xresnet}.yaml --out <bb>/pretrain
 
-# Sonde linéaire (encodeur gelé) et fine-tuning (--random-init pour la baseline iso-archi)
-python -m jepa.probe    --ckpt runs/cnn_v2/best.pt
-python -m jepa.classify --ckpt runs/cnn_v2/best.pt --train-frac 0.05 --seed 0
+# Évaluation unifiée : sonde gelée, fine-tuning (early-stopping), supervisé BN
+python -m jepa.eval --mode probe      --config jepa/configs/cnn.yaml --ckpt runs/cnn/pretrain/best.pt --out runs/cnn/jepa/probe/s0
+python -m jepa.eval --mode finetune   --config jepa/configs/cnn.yaml --random-init --train-frac 0.05 --seed 0 --out runs/cnn/scratch/ft5/s0
+python -m jepa.eval --mode supervised --config jepa/configs/xresnet_supervised.yaml --seed 0 --out runs/xresnet_bn/supervised/ft100/s0
 
-# Baseline supervisée from-scratch (xresnet)
-python -m jepa.supervised --config jepa/configs/xresnet.yaml --out runs/xresnet18
-
-# Régénérer les figures de ce README depuis runs/
-python make_figures.py
+# Toute la campagne (idempotent/reprenable), agrégation, figures
+python -m jepa.experiment --steps pretrain,probe,finetune,supervised
+python -m jepa.aggregate          # -> runs/results.json
+python make_figures.py            # -> figures/*.png
 ```
 
-**Structure.** `jepa/models/` (config, ViT, CNN, predictor) · `jepa/train/` · `jepa/probe/` ·
-`jepa/classify/` · `jepa/supervised/` (xresnet) · `jepa/decode/` · `jepa/configs/*.yaml`.
-Le rapport détaillé de la campagne CNN vit dans [`rapport/RAPPORT_CNN_JEPA.md`](rapport/RAPPORT_CNN_JEPA.md).
+**Structure.** `jepa/models/` (config, ViT, CNN, xresnet, predictor) · `jepa/train/`
+(pré-entraînement JEPA) · `jepa/eval/` (probe + finetune + supervised, métriques + IC) ·
+`jepa/experiment.py` (driver) · `jepa/aggregate.py` (→ `results.json`) · `jepa/configs/*.yaml` ·
+`notebooks/run_campaign.ipynb` (Colab). Figures régénérables via `make_figures.py`.
