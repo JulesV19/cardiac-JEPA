@@ -15,7 +15,7 @@ intervalles de confiance bootstrap. Baseline aléatoire toujours **iso-architect
 chiffres ci-dessous sont en **test / fold 10**, moyenne ± écart-type inter-graines.
 
 ---
-## Résultats en bref
+## Quelques résultats
 
 1. **Le JEPA apprend une représentation.** Sur encodeur **gelé**, une sonde linéaire gagne
    **+0,035 à +0,062** de macro-AUROC vs un encodeur aléatoire sans label d'entraînement.
